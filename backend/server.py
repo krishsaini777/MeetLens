@@ -62,6 +62,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     groq_client = GroqClient(
         api_key=config.GROQ_API_KEY,
         model=config.GROQ_MODEL,
+        expected_sample_rate=config.AUDIO_SAMPLE_RATE,  # Enforces 16000 Hz WAV constraint
     )
     gemini_client = GeminiClient(
         api_key=config.GEMINI_API_KEY,
@@ -70,8 +71,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     pdf_generator = PDFGenerator()
 
     logger.info(
-        'Services ready. Groq model: %s | Gemini model: %s',
-        config.GROQ_MODEL, config.GEMINI_MODEL,
+        'Services ready. Groq model: %s | Gemini model: %s | Custom vocabulary: %s',
+        config.GROQ_MODEL,
+        config.GEMINI_MODEL,
+        f'"{config.WHISPER_CUSTOM_VOCABULARY[:80]}"' if config.WHISPER_CUSTOM_VOCABULARY else 'DISABLED (set WHISPER_CUSTOM_VOCABULARY in .env)',
     )
     yield
     logger.info('Shutting down MeetLens v2 backend.')
@@ -177,6 +180,7 @@ async def transcribe(
             audio_bytes=audio_bytes,
             language=language,
             filename=audio.filename or 'chunk.wav',
+            prompt=config.WHISPER_CUSTOM_VOCABULARY,  # dynamic vocabulary from .env
         )
         return JSONResponse(content=result)
 
