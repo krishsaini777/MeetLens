@@ -1,17 +1,16 @@
-# MeetLens — Real-Time Dual-Stream Meeting Transcriber
+# MeetLens — Real-Time Cloud-Accelerated Meeting Transcriber
 
-> **Privacy-first, zero-cloud-dependency meeting transcription with speaker diarization and NLP cleaning.**
+> **Cloud-accelerated meeting transcription with client-side VAD, Groq Whisper, and Gemini summarization.**
 
 ## Overview
 
-MeetLens is a Chrome Extension + local Python backend system that captures, diarizes, and transcribes multi-speaker Google Meet calls **entirely on your machine**. No audio ever leaves your computer.
+MeetLens is a powerful Chrome Extension + Python backend system designed to capture, transcribe, and summarize Google Meet calls in real-time. It leverages a modern cloud-accelerated architecture to deliver low-latency transcription and intelligent insights without locking up your local machine's resources.
 
-The system runs two parallel audio streams simultaneously:
-
-- **Stream 1 (Local Mic):** Your own microphone is transcribed in-browser using the Web Speech API (`webkitSpeechRecognition`), giving near-instant results labelled as "Me."
-- **Stream 2 (Tab Audio):** Remote participants' audio is captured via Chrome's `tabCapture` API, streamed over WebSocket to a local Python server that runs **pyannote.audio** speaker diarization and **faster-whisper** transcription, then returns speaker-labelled results.
-
-All transcripts are run through a client-side NLP pipeline (compromise.js) that removes filler words ("um," "uh," "like") and stop-words fetched from a configurable GitHub list, producing a clean, readable transcript alongside the raw original.
+The system handles audio in a seamless pipeline:
+- **Client-Side VAD:** Audio is captured from the active tab and processed locally using an advanced Voice Activity Detection (VAD) pipeline in the browser.
+- **Real-Time Transcription:** Audio chunks are sent to the local FastAPI backend, which instantly proxies them to the **Groq Whisper API** for ultra-fast, highly accurate transcription.
+- **Intelligent Summarization:** The meeting transcript can be sent to the **Google Gemini API** to generate intelligent summaries, key points, and action items.
+- **NLP Cleaning:** The raw transcript is processed in the browser via `compromise.js` to remove filler words and stop-words, keeping your output clean and readable.
 
 ## Architecture
 
@@ -19,40 +18,46 @@ All transcripts are run through a client-side NLP pipeline (compromise.js) that 
 ┌─────────────────────────────────────────────────────────────────┐
 │                      CHROME EXTENSION                           │
 │                                                                 │
-│  ┌─────────────┐    ┌──────────────┐    ┌────────────────────┐  │
-│  │ background.js│───▶│ offscreen.js │    │     popup.js       │  │
-│  │              │    │              │    │                    │  │
-│  │ • tabCapture │    │ • getUserMedia│   │ • SpeechRecognition│  │
-│  │ • offscreen  │    │ • AudioCtx   │    │ • compromise.js    │  │
-│  │   lifecycle  │    │ • PCM extract│    │ • Dual-panel UI    │  │
-│  │              │    │ • WS client  │    │ • GitHub stopwords │  │
-│  └─────────────┘    └──────┬───────┘    └────────────────────┘  │
-│                            │ WebSocket (binary PCM)             │
-└────────────────────────────┼────────────────────────────────────┘
-                             │
-                             ▼
+│  ┌─────────────┐   ┌─────────────────┐   ┌───────────────────┐  │
+│  │background.js│──▶│audio-processor.js│──▶│   api-client.js   │  │
+│  │             │   │                 │   │                   │  │
+│  │• tabCapture │   │• Client-Side VAD│   │• REST API wrapper │  │
+│  │             │   │• Chunking       │   │• Error handling   │  │
+│  └─────────────┘   └────────┬────────┘   └─────────┬─────────┘  │
+│                             │                      │            │
+│                             ▼                      ▼            │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │                         popup.js                          │  │
+│  │ • UI Rendering • Inline Editing • compromise.js (NLP)     │  │
+│  └───────────────────────────────────────────────────────────┘  │
+│                                │ REST (POST /transcribe, etc)   │
+└────────────────────────────────┼────────────────────────────────┘
+                                 ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    PYTHON BACKEND (local)                        │
+│                      PYTHON BACKEND (FastAPI)                   │
 │                                                                 │
-│  ┌──────────┐  ┌─────────────┐  ┌──────────────┐  ┌─────────┐  │
-│  │ server.py│─▶│audio_buffer │─▶│  diarizer.py │─▶│transcrib│  │
-│  │ (FastAPI)│  │   .py       │  │  (pyannote)  │  │  er.py  │  │
-│  │ WS /audio│  │ PCM buffer  │  │  speaker     │  │ (faster │  │
-│  │          │◀─│ threshold   │  │  clustering  │  │ whisper)│  │
-│  └──────────┘  └─────────────┘  └──────────────┘  └─────────┘  │
+│  ┌─────────────┐   ┌─────────────────┐   ┌───────────────────┐  │
+│  │  server.py  │──▶│ groq_client.py  │──▶│ Groq Whisper API  │  │
+│  │  (REST API) │   └─────────────────┘   └───────────────────┘  │
+│  │             │   ┌─────────────────┐   ┌───────────────────┐  │
+│  │• /transcribe│──▶│gemini_client.py │──▶│ Google Gemini API │  │
+│  │• /summarize │   └─────────────────┘   └───────────────────┘  │
+│  │• /export    │   ┌─────────────────┐   ┌───────────────────┐  │
+│  │             │──▶│pdf_generator.py │──▶│ PDF/ZIP Export    │  │
+│  └─────────────┘   └─────────────────┘   └───────────────────┘  │
 │                                                                 │
-│  config.py ── loads .env ── all settings externalised           │
+│    config.py ── loads .env ── handles all credentials           │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
 ## Prerequisites
 
-| Requirement       | Version     |
+| Requirement       | Description |
 |-------------------|-------------|
 | Python            | 3.10+       |
 | Google Chrome     | 120+        |
-| HuggingFace Token | [Get one →](https://huggingface.co/settings/tokens) |
-| CUDA (optional)   | For faster GPU inference |
+| Groq API Key      | [Get one →](https://console.groq.com/keys) For Whisper transcription |
+| Gemini API Key    | [Get one →](https://aistudio.google.com/app/apikey) For intelligent summarization |
 
 > **Note:** Node.js is not required. The extension uses vanilla JS and a bundled `compromise.min.js`.
 
@@ -78,10 +83,11 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Edit `.env` and set your **HuggingFace token**:
+Edit `.env` and set your API keys:
 
 ```env
-PYANNOTE_AUTH_TOKEN=hf_YOUR_ACTUAL_TOKEN_HERE
+GROQ_API_KEY=your_groq_api_key_here
+GEMINI_API_KEY=your_gemini_api_key_here
 ```
 
 ### 4. Start the Backend Server
@@ -103,34 +109,17 @@ curl http://localhost:8000/health
 3. Click **Load unpacked** → select the `extension/` folder
 4. Navigate to a Google Meet call and click the MeetLens icon
 
-## Running Tests
-
-```bash
-# Full suite with verbose output
-pytest backend/tests/ -v --tb=short
-
-# With coverage report
-pytest backend/tests/ -v --cov=backend --cov-report=term-missing
-
-# Just AudioBuffer tests (no GPU/token needed)
-pytest backend/tests/test_audio_buffer.py -v
-```
-
-> **Note:** Diarizer tests require `PYANNOTE_AUTH_TOKEN` and fixture WAV files in `backend/tests/fixtures/`. Without these, they are automatically skipped.
-
 ## Features
 
 | Feature | Description |
 |---------|-------------|
-| 🎙️ Dual-Stream Capture | Separate local mic and tab audio streams |
-| 🔇 Privacy-First | All processing local — no data leaves your machine |
-| 👥 Speaker Diarization | pyannote.audio identifies up to 4 speakers |
-| 📝 Real-Time Transcription | faster-whisper (CTranslate2) with int8 CPU support |
-| 🧹 NLP Cleaning | compromise.js removes fillers, interjections, stop-words |
-| 📊 Dual Panel UI | Side-by-side raw and cleaned transcript |
-| 🔊 Audio Preserved | User still hears meeting audio during capture |
-| 🔁 Auto-Reconnect | WebSocket reconnects up to 3 times on failure |
-| ⚙️ Configurable | All settings via `.env` — no hardcoded values |
+| ⚡ Cloud-Accelerated | Groq Whisper API for ultra-low latency streaming transcription |
+| 🧠 AI Summarization | Google Gemini API generates intelligent meeting summaries and action items |
+| 🎙️ Client-Side VAD | In-browser Voice Activity Detection for efficient audio chunking |
+| 🧹 NLP Cleaning | `compromise.js` removes fillers, interjections, and stop-words |
+| 📝 Inline Editing | Seamlessly edit the transcript text on the fly |
+| 📄 Export Options | Export the full transcript and summary as PDF or Markdown |
+| ⚙️ Configurable | Backend managed via `.env` — no hardcoded values |
 
 ## File Structure
 
@@ -138,25 +127,22 @@ pytest backend/tests/test_audio_buffer.py -v
 MeetLens/
 ├── extension/
 │   ├── manifest.json          # MV3 manifest
-│   ├── background.js          # Service worker: tabCapture + offscreen
-│   ├── offscreen.html         # Hidden document for audio APIs
-│   ├── offscreen.js           # Audio capture, PCM extraction, WS client
+│   ├── background.js          # Service worker: tabCapture setup
+│   ├── audio-processor.js     # Client-side VAD and PCM processing
+│   ├── api-client.js          # REST client communicating with FastAPI backend
 │   ├── popup.html             # Extension popup UI
-│   ├── popup.js               # NLP pipeline, SpeechRecognition, rendering
+│   ├── popup.js               # UI logic, inline editing, NLP cleaning
 │   └── lib/
 │       └── compromise.min.js  # Bundled NLP library
 ├── backend/
-│   ├── server.py              # FastAPI app + WebSocket endpoint
-│   ├── config.py              # Environment configuration
-│   ├── audio_buffer.py        # PCM chunk accumulator
-│   ├── diarizer.py            # pyannote.audio wrapper
-│   ├── transcriber.py         # faster-whisper wrapper
-│   ├── requirements.txt       # Pinned Python dependencies
+│   ├── server.py              # FastAPI application
+│   ├── config.py              # Environment configuration loader
+│   ├── groq_client.py         # Groq API wrapper
+│   ├── gemini_client.py       # Google Gemini API wrapper
+│   ├── pdf_generator.py       # Generates PDF/ZIP exports
+│   ├── requirements.txt       # Python dependencies
 │   └── tests/
-│       ├── test_audio_buffer.py
-│       ├── test_diarizer.py
-│       ├── test_server.py
-│       └── fixtures/          # Test WAV files (not committed)
+│       └── ...                # Test suite
 ├── .env.example               # Environment variable template
 ├── .gitignore
 └── README.md
@@ -166,17 +152,16 @@ MeetLens/
 
 | Team Member | Contribution Area |
 |-------------|-------------------|
-| Member 1 | Chrome Extension architecture, offscreen audio pipeline |
-| Member 2 | Python backend: diarization, transcription, WebSocket server |
-| Member 3 | NLP cleaning pipeline, compromise.js integration, UI design |
-| Member 4 | Testing, documentation, configuration management |
+| Member 1 | Chrome Extension frontend, client-side VAD, inline editing |
+| Member 2 | Python backend: FastAPI REST server, Groq Whisper integration |
+| Member 3 | Gemini summarization integration, PDF export generator |
+| Member 4 | NLP cleaning pipeline, UI design, documentation |
 
 ## Product Name Availability
 
 The name **"MeetLens"** was verified for availability:
 - ✅ No existing Chrome Extension with this exact name
 - ✅ Domain availability checked
-- *(Screenshot placeholder — add evidence before presentation)*
 
 ## License
 
