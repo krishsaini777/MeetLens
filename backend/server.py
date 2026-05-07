@@ -182,6 +182,17 @@ async def transcribe(
             filename=audio.filename or 'chunk.wav',
             prompt=config.WHISPER_CUSTOM_VOCABULARY,  # dynamic vocabulary from .env
         )
+
+        # ── Auto-Healing Pipeline ──────────────────────────────
+        # Pipe Whisper's raw output through Gemini proofreading to
+        # fix phonetic errors, broken proper nouns, and grammar that
+        # Whisper can't catch. Fail-open: if Gemini errors, the raw
+        # text is returned unchanged.
+        raw_text = result.get('text', '')
+        if raw_text and gemini_client is not None:
+            corrected = gemini_client.proofread_transcript(raw_text)
+            result['text'] = corrected
+
         return JSONResponse(content=result)
 
     except ValueError as ve:
