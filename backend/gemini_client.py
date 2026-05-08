@@ -25,6 +25,10 @@ class SummarizationError(Exception):
     """Raised when the Gemini summarization API fails."""
 
 
+class ProofreadingError(Exception):
+    """Raised when the Gemini proofreading call fails."""
+
+
 # ── Prompt Templates ──────────────────────────
 
 SYSTEM_PROMPT = """You are an expert meeting analyst. Your task is to analyze meeting transcripts and produce structured, actionable summaries.
@@ -44,6 +48,14 @@ Guidelines:
 - Write in the requested output language
 - The markdown field should include ## Summary, ## Key Points, ## Action Items sections
 """
+
+PROOFREAD_SYSTEM_PROMPT = (
+    'You are an invisible proofreader. Your only job is to fix phonetic '
+    'spelling errors, incorrect proper nouns, and bad grammar in the '
+    'following raw transcription. DO NOT rewrite the sentence, do not '
+    'summarize, and do not add any conversational filler. Only return '
+    'the corrected text.'
+)
 
 USER_PROMPT_TEMPLATE = """Please analyze this meeting transcript and generate a structured summary in {language_name}.
 
@@ -75,6 +87,79 @@ class GeminiClient:
         self._client = None  # Lazy-loaded
 
     # ── Public API ────────────────────────────────
+
+    def proofread_transcript(
+        self,
+        raw_text: str,
+        meeting_context: str = 'general',
+    ) -> str:
+        """Auto-heal a raw Whisper transcript using Gemini.
+
+        Fixes phonetic misspellings, broken proper nouns, and grammar
+        without rewriting the sentence structure.  Uses gemini-2.0-flash
+        for sub-second latency.
+
+        Parameters
+        ----------
+        raw_text : str
+            The raw transcript text returned by Groq Whisper.
+        meeting_context : str
+            Optional context hint (e.g. 'engineering standup',
+            'sales call'). Helps Gemini disambiguate domain terms.
+
+        Returns
+        -------
+        str
+            Corrected transcript text. If proofreading fails, the
+            original ``raw_text`` is returned unchanged (fail-open).
+        """
+        raw_text = (raw_text or '').strip()
+        if not raw_text:
+            return raw_text
+
+        try:
+            import google.generativeai as genai  # noqa: local import
+            self._get_client()  # ensure API key is configured
+
+            model = genai.GenerativeModel(
+                model_name=self.model,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.1,    # near-deterministic for corrections
+                    max_output_tokens=512,  # short chunks, keep it fast
+                ),
+                system_instruction=PROOFREAD_SYSTEM_PROMPT,
+            )
+
+            # Build a minimal user prompt with optional context
+            user_prompt = raw_text
+            if meeting_context and meeting_context != 'general':
+                user_prompt = (
+                    f'[Meeting context: {meeting_context}]\n\n{raw_text}'
+                )
+
+            start = time.monotonic()
+            response = model.generate_content(user_prompt)
+            elapsed = time.monotonic() - start
+
+            corrected = (response.text or '').strip()
+
+            if corrected and corrected != raw_text:
+                logger.info(
+                    'Proofread in %.2fs: "%s" → "%s"',
+                    elapsed, raw_text[:50], corrected[:50],
+                )
+                return corrected
+
+            logger.debug('Proofread in %.2fs: no changes needed.', elapsed)
+            return raw_text
+
+        except Exception as exc:
+            # Fail-open: if Gemini is down or errors, return the raw text
+            # so the pipeline never blocks on proofreading failures.
+            logger.warning(
+                'Proofreading failed (returning raw text): %s', exc,
+            )
+            return raw_text
 
     def summarize(
         self,
@@ -245,3 +330,4 @@ class GeminiClient:
                     'Run: pip install google-generativeai'
                 ) from exc
         return self._client
+

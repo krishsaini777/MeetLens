@@ -96,7 +96,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     groq_client = GroqClient(
         api_key=config.GROQ_API_KEY,
         model=config.GROQ_MODEL,
+<<<<<<< HEAD
         llm_model=config.GROQ_LLM_MODEL,
+=======
+        expected_sample_rate=config.AUDIO_SAMPLE_RATE,  # Enforces 16000 Hz WAV constraint
+>>>>>>> 5fcf2994ef9a6e3022af142b0600a2c7eb0fbc92
     )
     gemini_client = GeminiClient(
         api_key=config.GEMINI_API_KEY,
@@ -105,9 +109,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     pdf_generator = PDFGenerator()
 
     logger.info(
+<<<<<<< HEAD
         'Services ready. Whisper: %s | LLM: %s | Gemini: %s | VAD threshold: %.2f',
         config.GROQ_MODEL, config.GROQ_LLM_MODEL,
         config.GEMINI_MODEL, config.VAD_THRESHOLD,
+=======
+        'Services ready. Groq model: %s | Gemini model: %s | Custom vocabulary: %s',
+        config.GROQ_MODEL,
+        config.GEMINI_MODEL,
+        f'"{config.WHISPER_CUSTOM_VOCABULARY[:80]}"' if config.WHISPER_CUSTOM_VOCABULARY else 'DISABLED (set WHISPER_CUSTOM_VOCABULARY in .env)',
+>>>>>>> 5fcf2994ef9a6e3022af142b0600a2c7eb0fbc92
     )
     yield
     logger.info('Shutting down MeetLens v3 backend.')
@@ -533,7 +544,19 @@ async def transcribe(
             source_language=language,
             target_language=target_language,
             filename=audio.filename or 'chunk.wav',
+            prompt=config.WHISPER_CUSTOM_VOCABULARY,  # dynamic vocabulary from .env
         )
+
+        # ── Auto-Healing Pipeline ──────────────────────────────
+        # Pipe Whisper's raw output through Gemini proofreading to
+        # fix phonetic errors, broken proper nouns, and grammar that
+        # Whisper can't catch. Fail-open: if Gemini errors, the raw
+        # text is returned unchanged.
+        raw_text = result.get('text', '')
+        if raw_text and gemini_client is not None:
+            corrected = gemini_client.proofread_transcript(raw_text)
+            result['text'] = corrected
+
         return JSONResponse(content=result)
 
     except ValueError as ve:

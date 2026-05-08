@@ -53,6 +53,7 @@ class Config:
     DEFAULT_LANGUAGE: str = field(
         default_factory=lambda: os.getenv('DEFAULT_LANGUAGE', 'en')
     )
+<<<<<<< HEAD
     TARGET_LANGUAGE: str = field(
         default_factory=lambda: os.getenv('TARGET_LANGUAGE', 'en')
     )
@@ -69,6 +70,13 @@ class Config:
     )
     VAD_MAX_SPEECH_S: float = field(
         default_factory=lambda: float(os.getenv('VAD_MAX_SPEECH_S', '30.0'))
+=======
+    # Dynamic vocabulary injection for Whisper accuracy.
+    # Loaded from WHISPER_CUSTOM_VOCABULARY in .env — users add their own
+    # domain-specific terms. Empty string = feature disabled.
+    WHISPER_CUSTOM_VOCABULARY: str = field(
+        default_factory=lambda: os.getenv('WHISPER_CUSTOM_VOCABULARY', '').strip()
+>>>>>>> 5fcf2994ef9a6e3022af142b0600a2c7eb0fbc92
     )
 
     # ── Server ────────────────────────────────────
