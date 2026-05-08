@@ -185,6 +185,14 @@
     .t-line.bookmarked .t-bm { opacity:1; }
     .t-line:hover .t-bm { opacity:0.5; }
 
+    /* LLM-refined indicator — shows raw text on hover */
+    .t-text.has-raw { position:relative; }
+    .t-text.has-raw::after {
+      content:'✦'; font-size:8px; color:var(--green); margin-left:4px;
+      vertical-align:super; opacity:0.6;
+    }
+    .t-text.has-raw:hover::after { opacity:1; }
+
     /* Skeleton loader */
     .skeleton-line {
       height:14px; border-radius:7px; margin-bottom:8px;

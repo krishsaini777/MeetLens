@@ -1,10 +1,17 @@
 /**
- * popup.js — MeetLens v2 Popup Controller
+ * popup.js — MeetLens v3 Popup Controller
+ *
+ * v3 Architecture Changes:
+ *   - AudioProcessor now emits raw PCM frames (not WAV blobs)
+ *   - ApiClient streams PCM over WebSocket (not REST POST)
+ *   - Server-side Silero VAD detects sentence boundaries
+ *   - Dual display: refined text (primary) + raw Whisper text (secondary)
+ *   - Language selector now configures both source and target language
  *
  * Responsibilities:
- *   A. Audio capture via AudioProcessor (VAD + WAV chunking)
- *   B. REST API calls via ApiClient (transcribe / summarize / export)
- *   C. Real-time transcript rendering with streaming text effect
+ *   A. Audio capture via AudioProcessor (continuous PCM streaming)
+ *   B. WebSocket connection via ApiClient (stream PCM, receive transcripts)
+ *   C. Real-time transcript rendering with raw/refined dual view
  *   D. Bookmark system (button + Ctrl+Space shortcut)
  *   E. Inline transcript editing
  *   F. Auto-save to chrome.storage.local every 10 seconds
@@ -18,10 +25,16 @@
 import { AudioProcessor } from './audio-processor.js';
 import { ApiClient }       from './api-client.js';
 
+// ── Language Map ─────────────────────────────
+const LANGUAGE_NAMES = {
+  en: 'English', es: 'Spanish', fr: 'French', de: 'German',
+  it: 'Italian', pt: 'Portuguese', hi: 'Hindi', ja: 'Japanese',
+  ko: 'Korean', zh: 'Chinese', ar: 'Arabic', ru: 'Russian',
+};
+
 // ── Constants ────────────────────────────────
 const STORAGE_KEY    = 'meetlens_session';
 const AUTOSAVE_MS    = 10_000;
-const BACKEND_URL    = 'http://localhost:8000';
 
 // ── State ─────────────────────────────────────
 let isRecording  = false;
@@ -29,9 +42,9 @@ let isPaused     = false;
 let sessionStart = null;
 let timerInterval = null;
 let autosaveInterval = null;
-let chunkCount   = 0;
+let segmentCount = 0;
 
-let transcript   = [];   // [{id, timestamp, text, bookmarked}]
+let transcript   = [];   // [{id, timestamp, text, raw_text, bookmarked}]
 let bookmarks    = [];   // [{id, timestamp, text}]
 let summaryData  = null; // {summary, key_points, action_items, markdown}
 
@@ -75,9 +88,30 @@ document.addEventListener('DOMContentLoaded', async () => {
 
 function initApiClient() {
   client = new ApiClient(
-    (result)  => appendTranscript(result.text, result.replayed),
-    (msg)     => showBanner('error', '⚠️', msg),
-    (status)  => { footerStatus.textContent = status; },
+    // onTranscript
+    (result) => {
+      removeSkeleton();
+      appendTranscript(result.text, result.raw_text, result.pipeline_ms);
+    },
+    // onVADEvent
+    (event) => {
+      if (event.event === 'speech_end') {
+        showSkeleton();
+        footerStatus.textContent = `segment #${event.segment_id} detected (${event.duration_s}s)…`;
+      }
+    },
+    // onError
+    (msg) => showBanner('error', '⚠️', msg),
+    // onStatusChange
+    (status) => {
+      footerStatus.textContent = status;
+      // Update connection indicator
+      if (status === 'connected') {
+        statusPill.classList.remove('offline');
+      } else if (status === 'connection lost') {
+        statusPill.classList.add('offline');
+      }
+    },
   );
 }
 
@@ -94,6 +128,16 @@ function bindEvents() {
 
   tabTranscript.addEventListener('click', () => switchTab('transcript'));
   tabSummary.addEventListener('click',    () => switchTab('summary'));
+
+  // Update language config when changed mid-session
+  langSelect.addEventListener('change', () => {
+    if (client && client.isConnected) {
+      const lang = langSelect.value;
+      const targetName = LANGUAGE_NAMES[lang] || 'English';
+      client.updateConfig(lang, targetName);
+      footerStatus.textContent = `Language → ${targetName}`;
+    }
+  });
 
   // Bookmark shortcut from background.js (Ctrl+Space relay)
   chrome.runtime.onMessage.addListener((msg) => {
@@ -113,9 +157,20 @@ async function checkBackendHealth() {
 
 // ── Session Lifecycle ─────────────────────────
 async function handleStart() {
+  const lang = langSelect.value;
+  const targetName = LANGUAGE_NAMES[lang] || 'English';
+
+  // 1. Connect WebSocket first
+  await client.connectWebSocket(lang, targetName);
+  if (!client.isConnected) {
+    showBanner('error', '⚠️', 'Failed to connect to backend WebSocket.');
+    return;
+  }
+
+  // 2. Start audio capture — PCM frames are sent directly to WebSocket
   processor = new AudioProcessor(
-    (blob) => onAudioChunk(blob),
-    (err)  => { showBanner('error', '⚠️', err); handleStop(); },
+    (pcmBuffer) => client.sendAudio(pcmBuffer),  // Stream PCM directly
+    (err) => { showBanner('error', '⚠️', err); handleStop(); },
   );
 
   await processor.start();
@@ -124,18 +179,19 @@ async function handleStart() {
   isRecording  = true;
   isPaused     = false;
   sessionStart = Date.now();
-  chunkCount   = 0;
+  segmentCount = 0;
 
   setUIState('recording');
   startTimer();
   startAutosave();
   hideBanner();
   switchTab('transcript');
-  footerStatus.textContent = 'Listening…';
+  footerStatus.textContent = 'Streaming audio → Silero VAD…';
 }
 
 function handleStop() {
   if (processor) { processor.stop(); processor = null; }
+  if (client) { client.disconnectWebSocket(); }
 
   isRecording = false;
   isPaused    = false;
@@ -169,35 +225,34 @@ function handlePause() {
   }
 }
 
-// ── Audio Processing ──────────────────────────
-async function onAudioChunk(blob) {
-  const lang = langSelect.value;
-  chunkCount++;
-  footerStatus.textContent = `chunk #${chunkCount} sent…`;
-  showSkeleton();
-  await client.transcribeChunk(blob, lang);
-}
-
 // ── Transcript Rendering ──────────────────────
-function appendTranscript(text, replayed = false) {
-  text = text.trim();
+function appendTranscript(text, rawText = '', pipelineMs = 0) {
+  text = (text || '').trim();
   if (!text) return;
 
   removeSkeleton();
 
+  segmentCount++;
   const id        = `t_${Date.now()}`;
   const tsMs      = Date.now();
   const tsLabel   = sessionStart
     ? formatDuration(Math.floor((tsMs - sessionStart) / 1000))
     : '--:--';
 
-  const entry = { id, timestamp: tsLabel, text, bookmarked: false };
+  const entry = {
+    id,
+    timestamp: tsLabel,
+    text,
+    raw_text: rawText,
+    bookmarked: false,
+    pipeline_ms: pipelineMs,
+  };
   transcript.push(entry);
   renderLine(entry);
 
   // Auto-scroll
   panelBody.scrollTop = panelBody.scrollHeight;
-  footerStatus.textContent = `chunk #${chunkCount} ✓${replayed ? ' (replayed)' : ''}`;
+  footerStatus.textContent = `segment #${segmentCount} ✓ (${pipelineMs}ms pipeline)`;
 }
 
 function renderLine(entry) {
@@ -235,6 +290,12 @@ function renderLine(entry) {
     if (e.key === 'Escape') { textEl.textContent = entry.text; textEl.blur(); }
   });
 
+  // Show raw Whisper text on hover (tooltip) if different from refined
+  if (entry.raw_text && entry.raw_text !== entry.text) {
+    textEl.title = `Raw Whisper: ${entry.raw_text}`;
+    textEl.classList.add('has-raw');
+  }
+
   const bm = document.createElement('span');
   bm.className = 't-bm';
   bm.textContent = '⭐';
@@ -258,7 +319,7 @@ function createEmptyState() {
   const d = document.createElement('div');
   d.className = 'empty-state';
   d.id = 'emptyState';
-  d.innerHTML = `<div class="empty-icon">🎙️</div><div class="empty-text">Press <strong>Start</strong> to begin transcribing.</div>`;
+  d.innerHTML = `<div class="empty-icon">🎙️</div><div class="empty-text">Press <strong>Start</strong> to begin transcribing.<br>Audio streams to Silero VAD for sentence detection.</div>`;
   return d;
 }
 
@@ -416,7 +477,7 @@ async function handleNewSession() {
   transcript  = [];
   bookmarks   = [];
   summaryData = null;
-  chunkCount  = 0;
+  segmentCount = 0;
   sessionStart = null;
   renderAllLines();
   summaryContent.innerHTML = `<div class="empty-state"><div class="empty-icon">✨</div><div class="empty-text">Stop recording and click <strong>Generate Summary</strong>.</div></div>`;

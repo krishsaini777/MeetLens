@@ -1,9 +1,15 @@
 """
-config.py — MeetLens v2 Backend Configuration
+config.py — MeetLens v3 Backend Configuration
 
 Loads environment variables from a .env file and exposes them as a validated
 Config dataclass. Raises ValueError immediately if mandatory API keys are
 missing so the server fails fast rather than crashing mid-session.
+
+v3 Changes:
+  - Added GROQ_LLM_MODEL for the refinement chain (llama-3.3-70b-versatile)
+  - Added VAD_* parameters for Silero VAD tuning
+  - Added TARGET_LANGUAGE for the LLM translation target
+  - Switched default GROQ_MODEL to whisper-large-v3 (full model)
 """
 
 from __future__ import annotations
@@ -19,7 +25,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), '.env'))
 
 @dataclass(frozen=True)
 class Config:
-    """Immutable configuration container for the MeetLens v2 backend."""
+    """Immutable configuration container for the MeetLens v3 backend."""
 
     # ── API Keys ──────────────────────────────────
     GROQ_API_KEY: str = field(
@@ -31,7 +37,10 @@ class Config:
 
     # ── Model Selection ───────────────────────────
     GROQ_MODEL: str = field(
-        default_factory=lambda: os.getenv('GROQ_MODEL', 'whisper-large-v3-turbo')
+        default_factory=lambda: os.getenv('GROQ_MODEL', 'whisper-large-v3')
+    )
+    GROQ_LLM_MODEL: str = field(
+        default_factory=lambda: os.getenv('GROQ_LLM_MODEL', 'llama-3.3-70b-versatile')
     )
     GEMINI_MODEL: str = field(
         default_factory=lambda: os.getenv('GEMINI_MODEL', 'gemini-2.0-flash')
@@ -43,6 +52,23 @@ class Config:
     )
     DEFAULT_LANGUAGE: str = field(
         default_factory=lambda: os.getenv('DEFAULT_LANGUAGE', 'en')
+    )
+    TARGET_LANGUAGE: str = field(
+        default_factory=lambda: os.getenv('TARGET_LANGUAGE', 'en')
+    )
+
+    # ── Silero VAD Tuning ─────────────────────────
+    VAD_THRESHOLD: float = field(
+        default_factory=lambda: float(os.getenv('VAD_THRESHOLD', '0.5'))
+    )
+    VAD_MIN_SILENCE_MS: int = field(
+        default_factory=lambda: int(os.getenv('VAD_MIN_SILENCE_MS', '700'))
+    )
+    VAD_MIN_SPEECH_MS: int = field(
+        default_factory=lambda: int(os.getenv('VAD_MIN_SPEECH_MS', '250'))
+    )
+    VAD_MAX_SPEECH_S: float = field(
+        default_factory=lambda: float(os.getenv('VAD_MAX_SPEECH_S', '30.0'))
     )
 
     # ── Server ────────────────────────────────────
