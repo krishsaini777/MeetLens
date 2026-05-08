@@ -1,7 +1,15 @@
 """
 groq_client.py — Groq Whisper + LLM Refinement Pipeline (v3)
 
-<<<<<<< HEAD
+Handles audio transcription via the Groq Whisper API.
+Supports multi-language output with retry logic and structured error handling.
+
+Hardware Constraint Enforcement:
+  The WAV header is parsed on every /transcribe call to verify the sample
+  rate matches AUDIO_SAMPLE_RATE (16000 Hz). If the frontend accidentally
+  sends 44100 Hz or 48000 Hz audio, a ValueError is raised immediately
+  rather than silently sending degraded audio to Whisper.
+
 Two-stage transcription pipeline:
   Stage 1: groq.audio.transcriptions (whisper-large-v3)
            → Native language text with full acoustic fidelity
@@ -11,16 +19,6 @@ Two-stage transcription pipeline:
 This dual-step design ensures we never lose acoustic accuracy by translating
 too early. Whisper outputs the source language faithfully, then the LLM
 handles intelligent refinement.
-=======
-Handles audio transcription via the Groq Whisper API.
-Supports multi-language output with retry logic and structured error handling.
-
-Hardware Constraint Enforcement:
-  The WAV header is parsed on every /transcribe call to verify the sample
-  rate matches AUDIO_SAMPLE_RATE (16000 Hz). If the frontend accidentally
-  sends 44100 Hz or 48000 Hz audio, a ValueError is raised immediately
-  rather than silently sending degraded audio to Whisper.
->>>>>>> 5fcf2994ef9a6e3022af142b0600a2c7eb0fbc92
 """
 
 from __future__ import annotations
@@ -82,37 +80,26 @@ class GroqClient:
     api_key : str
         Groq API key.
     model : str
-<<<<<<< HEAD
         Whisper model variant (default: 'whisper-large-v3').
     llm_model : str
         LLM model for refinement (default: 'llama-3.3-70b-versatile').
-=======
-        Whisper model variant (e.g. 'whisper-large-v3-turbo').
     expected_sample_rate : int
         Expected WAV sample rate in Hz. Every audio chunk is validated
         against this value before being sent to Groq. Must match
         AUDIO_SAMPLE_RATE in .env (default 16000).
->>>>>>> 5fcf2994ef9a6e3022af142b0600a2c7eb0fbc92
     """
 
     def __init__(
         self,
         api_key: str,
-<<<<<<< HEAD
         model: str = 'whisper-large-v3',
         llm_model: str = 'llama-3.3-70b-versatile',
-    ) -> None:
-        self.api_key = api_key
-        self.model = model
-        self.llm_model = llm_model
-=======
-        model: str = 'whisper-large-v3-turbo',
         expected_sample_rate: int = 16000,
     ) -> None:
         self.api_key = api_key
         self.model = model
+        self.llm_model = llm_model
         self.expected_sample_rate = expected_sample_rate
->>>>>>> 5fcf2994ef9a6e3022af142b0600a2c7eb0fbc92
         self._client = None  # Lazy-loaded
 
     # ── Public API ────────────────────────────────
@@ -205,16 +192,8 @@ class GroqClient:
             try:
                 start = time.monotonic()
 
-<<<<<<< HEAD
                 # CRITICAL: Use audio.transcriptions, NOT translations
                 # This preserves the native language text for acoustic accuracy
-                transcription = client.audio.transcriptions.create(
-                    file=(filename, audio_bytes, 'audio/wav'),
-                    model=self.model,
-                    language=language,
-                    response_format='verbose_json',
-                )
-=======
                 # Build the API call kwargs.
                 # initial_prompt is Whisper's "cheat sheet" for proper nouns:
                 # the model treats it as preceding context and strongly prefers
@@ -230,7 +209,6 @@ class GroqClient:
                     logger.debug('Using Whisper prompt (%d chars): %s', len(prompt), prompt[:80])
 
                 transcription = client.audio.transcriptions.create(**api_kwargs)
->>>>>>> 5fcf2994ef9a6e3022af142b0600a2c7eb0fbc92
 
                 elapsed = time.monotonic() - start
                 text = (transcription.text or '').strip()
