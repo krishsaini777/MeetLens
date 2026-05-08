@@ -340,6 +340,7 @@ class GroqClient:
         source_language: str = 'en',
         target_language: str = 'English',
         filename: str = 'audio.wav',
+        prompt: str = '',
     ) -> Dict[str, object]:
         """Full pipeline: Whisper transcription → LLM refinement.
 
@@ -353,6 +354,8 @@ class GroqClient:
             Full language name for LLM translation target.
         filename : str
             Filename hint.
+        prompt : str
+            Whisper initial_prompt for custom vocabulary injection.
 
         Returns
         -------
@@ -366,6 +369,7 @@ class GroqClient:
             audio_bytes=audio_bytes,
             language=source_language,
             filename=filename,
+            prompt=prompt,
         )
 
         raw_text = whisper_result['text']
