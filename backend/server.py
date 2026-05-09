@@ -193,6 +193,12 @@ class VADSession:
     Accumulates PCM audio, runs Silero VAD frame-by-frame, and detects
     sentence boundaries (speech → silence transitions). When a boundary
     is detected, it emits the accumulated speech segment for transcription.
+
+    Enhanced with detailed logging for:
+      - Speech probability values (periodic sampling)
+      - Speech ↔ silence transitions (speaker switching)
+      - Dropped / too-short segments
+      - Cumulative frame and segment statistics
     """
 
     def __init__(
@@ -218,6 +224,17 @@ class VADSession:
         # VAD processes 512-sample frames at 16kHz (32ms per frame)
         self._frame_size = 512
         self._pending_pcm = np.array([], dtype=np.float32)
+
+        # ── Diagnostic counters ─────────────────
+        self._total_frames = 0
+        self._speech_frames = 0
+        self._silence_frames = 0
+        self._segments_emitted = 0
+        self._segments_dropped = 0      # Too short to emit
+        self._forced_emissions = 0      # Max duration forced
+        self._speech_start_count = 0    # Number of speech→speaking transitions
+        self._prob_sum = 0.0            # For average probability tracking
+        self._prob_log_counter = 0      # Log every N frames
 
     def reset_vad_state(self):
         """Reset Silero VAD hidden state between segments."""
@@ -247,28 +264,60 @@ class VADSession:
 
             # Run Silero VAD on this frame
             speech_prob = self._get_speech_prob(frame)
+            self._total_frames += 1
+            self._prob_sum += speech_prob
+
+            # Periodic probability logging (every ~5 seconds = ~156 frames at 32ms)
+            self._prob_log_counter += 1
+            if self._prob_log_counter >= 156:
+                avg_prob = self._prob_sum / self._prob_log_counter
+                logger.debug(
+                    '[VAD PROB] avg=%.3f over %d frames | speech_frames=%d silence_frames=%d | '
+                    'segments_emitted=%d dropped=%d forced=%d | transitions=%d',
+                    avg_prob, self._prob_log_counter,
+                    self._speech_frames, self._silence_frames,
+                    self._segments_emitted, self._segments_dropped, self._forced_emissions,
+                    self._speech_start_count,
+                )
+                self._prob_sum = 0.0
+                self._prob_log_counter = 0
 
             if speech_prob >= self.threshold:
                 # Speech detected
+                self._speech_frames += 1
                 self._silence_counter = 0
 
                 if not self._is_speaking:
                     self._is_speaking = True
                     self._speech_buffer = []
                     self._speech_samples = 0
+                    self._speech_start_count += 1
                     self.reset_vad_state()
+                    logger.debug(
+                        '[VAD] Speech START (transition #%d, prob=%.3f)',
+                        self._speech_start_count, speech_prob,
+                    )
 
                 self._speech_buffer.append(frame)
                 self._speech_samples += len(frame)
 
                 # Force-emit if speech exceeds max duration
                 if self._speech_samples >= self.max_speech_samples:
+                    self._forced_emissions += 1
+                    duration_s = self._speech_samples / self.sample_rate
+                    logger.info(
+                        '[VAD] FORCED emission at %.1fs (max_speech_s=%.1f). '
+                        'This may indicate overlapping speakers or continuous speech.',
+                        duration_s, self.max_speech_samples / self.sample_rate,
+                    )
                     segment = self._emit_segment()
                     if segment is not None:
                         completed_segments.append(segment)
 
             else:
                 # Silence detected
+                self._silence_frames += 1
+
                 if self._is_speaking:
                     # Still include silence frames in the buffer
                     # (preserves trailing context for Whisper)
@@ -278,6 +327,12 @@ class VADSession:
 
                     # Sentence boundary: enough silence after speech
                     if self._silence_counter >= self.min_silence_samples:
+                        logger.debug(
+                            '[VAD] Speech END — silence boundary reached '
+                            '(silence=%dms, speech_samples=%d)',
+                            int(self._silence_counter * 1000 / self.sample_rate),
+                            self._speech_samples,
+                        )
                         segment = self._emit_segment()
                         if segment is not None:
                             completed_segments.append(segment)
@@ -291,21 +346,54 @@ class VADSession:
             segment = self._emit_segment()
             if segment is not None:
                 segments.append(segment)
+
+        # Log final session stats
+        logger.info(
+            '[VAD SESSION STATS] total_frames=%d | speech=%d silence=%d | '
+            'segments_emitted=%d dropped=%d forced=%d | speaker_transitions=%d',
+            self._total_frames, self._speech_frames, self._silence_frames,
+            self._segments_emitted, self._segments_dropped, self._forced_emissions,
+            self._speech_start_count,
+        )
+
         self._reset()
         return segments
 
     def _emit_segment(self) -> np.ndarray | None:
         """Emit the current speech buffer as a segment, then reset."""
         if self._speech_samples < self.min_speech_samples:
+            duration_ms = int(self._speech_samples * 1000 / self.sample_rate)
+            logger.debug(
+                '[VAD] DROPPED segment: too short (%dms < min %dms). '
+                'This may indicate a brief noise burst or mic tap.',
+                duration_ms,
+                int(self.min_speech_samples * 1000 / self.sample_rate),
+            )
+            self._segments_dropped += 1
             self._reset()
             return None
 
         segment = np.concatenate(self._speech_buffer)
         duration_s = len(segment) / self.sample_rate
-        logger.debug(
-            '[VAD] Emitting speech segment: %.2fs (%d samples)',
-            duration_s, len(segment),
+
+        # Compute RMS for audio level diagnostics
+        rms = float(np.sqrt(np.mean(segment ** 2)))
+        rms_db = 20 * np.log10(rms) if rms > 0 else -100.0
+
+        self._segments_emitted += 1
+        logger.info(
+            '[VAD] Emitting segment #%d: %.2fs (%d samples) | RMS=%.4f (%.1f dB)',
+            self._segments_emitted, duration_s, len(segment), rms, rms_db,
         )
+
+        # Warn if segment is very quiet (may produce poor transcription)
+        if rms_db < -35.0:
+            logger.warning(
+                '[VAD] ⚠️ Segment #%d is very quiet (%.1f dB). '
+                'Low-volume speaker or distant microphone may degrade accuracy.',
+                self._segments_emitted, rms_db,
+            )
+
         self._reset()
         return segment
 
