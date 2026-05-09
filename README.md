@@ -10,7 +10,6 @@ The system handles audio in a seamless pipeline:
 - **Client-Side VAD:** Audio is captured from the active tab and processed locally using an advanced Voice Activity Detection (VAD) pipeline in the browser.
 - **Real-Time Transcription:** Audio chunks are sent to the local FastAPI backend, which instantly proxies them to the **Groq Whisper API** for ultra-fast, highly accurate transcription.
 - **Intelligent Summarization:** The meeting transcript can be sent to the **Google Gemini API** to generate intelligent summaries, key points, and action items.
-- **NLP Cleaning:** The raw transcript is processed in the browser via `compromise.js` to remove filler words and stop-words, keeping your output clean and readable.
 
 ## Architecture
 
@@ -28,7 +27,7 @@ The system handles audio in a seamless pipeline:
 │                             ▼                      ▼            │
 │  ┌───────────────────────────────────────────────────────────┐  │
 │  │                         popup.js                          │  │
-│  │ • UI Rendering • Inline Editing • compromise.js (NLP)     │  │
+│  │ • UI Rendering • Inline Editing                           │  │
 │  └───────────────────────────────────────────────────────────┘  │
 │                                │ REST (POST /transcribe, etc)   │
 └────────────────────────────────┼────────────────────────────────┘
@@ -59,7 +58,7 @@ The system handles audio in a seamless pipeline:
 | Groq API Key      | [Get one →](https://console.groq.com/keys) For Whisper transcription |
 | Gemini API Key    | [Get one →](https://aistudio.google.com/app/apikey) For intelligent summarization |
 
-> **Note:** Node.js is not required. The extension uses vanilla JS and a bundled `compromise.min.js`.
+> **Note:** Node.js is not required. The extension uses vanilla JS.
 
 ## Setup
 
@@ -116,7 +115,6 @@ curl http://localhost:8000/health
 | ⚡ Cloud-Accelerated | Groq Whisper API for ultra-low latency streaming transcription |
 | 🧠 AI Summarization | Google Gemini API generates intelligent meeting summaries and action items |
 | 🎙️ Client-Side VAD | In-browser Voice Activity Detection for efficient audio chunking |
-| 🧹 NLP Cleaning | `compromise.js` removes fillers, interjections, and stop-words |
 | 📝 Inline Editing | Seamlessly edit the transcript text on the fly |
 | 📄 Export Options | Export the full transcript and summary as PDF or Markdown |
 | ⚙️ Configurable | Backend managed via `.env` — no hardcoded values |
@@ -131,9 +129,7 @@ MeetLens/
 │   ├── audio-processor.js     # Client-side VAD and PCM processing
 │   ├── api-client.js          # REST client communicating with FastAPI backend
 │   ├── popup.html             # Extension popup UI
-│   ├── popup.js               # UI logic, inline editing, NLP cleaning
-│   └── lib/
-│       └── compromise.min.js  # Bundled NLP library
+│   └── popup.js               # UI logic, inline editing
 ├── backend/
 │   ├── server.py              # FastAPI application
 │   ├── config.py              # Environment configuration loader
@@ -155,7 +151,7 @@ MeetLens/
 | Member 1 | Chrome Extension frontend, client-side VAD, inline editing |
 | Member 2 | Python backend: FastAPI REST server, Groq Whisper integration |
 | Member 3 | Gemini summarization integration, PDF export generator |
-| Member 4 | NLP cleaning pipeline, UI design, documentation |
+| Member 4 | UI design, auto-healing pipeline, documentation |
 
 ## Product Name Availability
 
@@ -166,3 +162,5 @@ The name **"MeetLens"** was verified for availability:
 ## License
 
 This project is developed for educational purposes.
+
+## does it work
