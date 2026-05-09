@@ -1,5 +1,5 @@
 # ──────────────────────────────────────────────────────
-# MeetLens v2 Python Backend — Pinned Dependencies
+# MeetLens v3 Python Backend — Pinned Dependencies
 # ──────────────────────────────────────────────────────
 # Install:  pip install -r requirements.txt
 # ──────────────────────────────────────────────────────
@@ -8,10 +8,16 @@
 fastapi==0.111.0
 uvicorn[standard]==0.30.1
 python-multipart==0.0.9
+websockets>=12.0
 
 # API clients
 groq==0.9.0
 google-generativeai==0.7.2
+
+# Silero VAD + PyTorch
+torch>=2.1.0
+torchaudio>=2.1.0
+numpy>=1.24.0
 
 # PDF generation
 reportlab==4.2.2
