@@ -36,7 +36,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from config import config
-from gemini_client import GeminiClient, SummarizationError
+from gemini_client import GeminiClient, GeminiKeyError, SummarizationError
 from groq_client import GroqClient, TranscriptionError, SUPPORTED_LANGUAGES
 from pdf_generator import PDFGenerator
 
@@ -105,10 +105,33 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     )
     pdf_generator = PDFGenerator()
 
+    # ── Validate Gemini API key at startup ──────────────────────────
+    # This catches leaked / revoked / quota-exhausted keys immediately
+    # instead of waiting until the first /summarize call fails.
+    gemini_ok, gemini_msg = gemini_client.validate_api_key()
+    if not gemini_ok:
+        logger.error(
+            '\n'
+            '╔══════════════════════════════════════════════════════════════╗\n'
+            '║  ⚠️  GEMINI API KEY VALIDATION FAILED                       ║\n'
+            '║                                                              ║\n'
+            '║  %s\n'
+            '║                                                              ║\n'
+            '║  Summarization will NOT work until you fix the key.          ║\n'
+            '║  → Generate a new key: https://aistudio.google.com/apikey    ║\n'
+            '║  → Update GEMINI_API_KEY in backend/.env                     ║\n'
+            '║  → Restart the server                                        ║\n'
+            '╚══════════════════════════════════════════════════════════════╝',
+            gemini_msg,
+        )
+    else:
+        logger.info('[Gemini] %s', gemini_msg)
+
     logger.info(
-        'Services ready. Whisper: %s | LLM: %s | Gemini: %s | VAD threshold: %.2f | Custom vocabulary: %s',
+        'Services ready. Whisper: %s | LLM: %s | Gemini: %s (%s) | VAD threshold: %.2f | Custom vocabulary: %s',
         config.GROQ_MODEL, config.GROQ_LLM_MODEL,
-        config.GEMINI_MODEL, config.VAD_THRESHOLD,
+        config.GEMINI_MODEL, 'VALID' if gemini_ok else 'INVALID KEY',
+        config.VAD_THRESHOLD,
         f'"{config.WHISPER_CUSTOM_VOCABULARY[:80]}"' if config.WHISPER_CUSTOM_VOCABULARY else 'DISABLED (set WHISPER_CUSTOM_VOCABULARY in .env)',
     )
     yield
@@ -670,7 +693,7 @@ async def summarize(request: SummarizeRequest) -> JSONResponse:
         raise HTTPException(status_code=400, detail='Transcript is empty.')
 
     logger.info(
-        'Summarizing %d chars, %d bookmarks, language=%s',
+        '[SUMMARIZE] Request received: %d chars, %d bookmarks, language=%s',
         len(request.transcript),
         len(request.bookmarks),
         request.language,
@@ -683,13 +706,44 @@ async def summarize(request: SummarizeRequest) -> JSONResponse:
             bookmarks=bookmarks_dicts,
             language=request.language,
         )
+
+        # ── Validate result is non-empty ──
+        if not result.get('summary') and not result.get('key_points'):
+            logger.warning(
+                '[SUMMARIZE] ⚠️ Gemini returned empty summary for %d char transcript. '
+                'Transcript preview: "%s"',
+                len(request.transcript),
+                request.transcript[:100],
+            )
+
+        logger.info(
+            '[SUMMARIZE] ✅ Success: summary=%d chars, key_points=%d, action_items=%d',
+            len(result.get('summary', '')),
+            len(result.get('key_points', [])),
+            len(result.get('action_items', [])),
+        )
         return JSONResponse(content=result)
 
+    except GeminiKeyError as ke:
+        logger.error(
+            '[SUMMARIZE] ❌ API KEY ERROR: %s\n'
+            'ACTION REQUIRED: Generate a new Gemini API key at '
+            'https://aistudio.google.com/apikey and update GEMINI_API_KEY in backend/.env',
+            ke,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f'Gemini API key error: {ke}. '
+                f'Generate a new key at https://aistudio.google.com/apikey '
+                f'and update GEMINI_API_KEY in backend/.env, then restart the server.'
+            ),
+        ) from ke
     except SummarizationError as se:
-        logger.error('Summarization failed: %s', se)
+        logger.error('[SUMMARIZE] ❌ Summarization failed: %s', se)
         raise HTTPException(status_code=502, detail=str(se)) from se
     except Exception as exc:
-        logger.error('Unexpected summarization error: %s', exc, exc_info=True)
+        logger.error('[SUMMARIZE] ❌ Unexpected error: %s', exc, exc_info=True)
         raise HTTPException(status_code=500, detail='Internal summarization error.') from exc
 
 

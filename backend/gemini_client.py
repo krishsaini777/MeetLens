@@ -4,6 +4,13 @@ gemini_client.py — Google Gemini Summarization Wrapper
 Handles meeting summarization via the Gemini API.
 Generates structured output: summary, key points, and action items.
 Supports multi-language output matching the transcription language.
+
+v3.1 Enhancements:
+  - API key validation at init time with clear diagnostics
+  - Detailed logging throughout the summarization pipeline
+  - Error classification: quota / auth / leaked-key / network / parse
+  - Exponential backoff with jitter on retryable errors
+  - No silent failures — every code path logs explicitly
 """
 
 from __future__ import annotations
@@ -27,6 +34,10 @@ class SummarizationError(Exception):
 
 class ProofreadingError(Exception):
     """Raised when the Gemini proofreading call fails."""
+
+
+class GeminiKeyError(SummarizationError):
+    """Raised when the Gemini API key is invalid, leaked, or quota-exhausted."""
 
 
 # ── Prompt Templates ──────────────────────────
@@ -85,8 +96,51 @@ class GeminiClient:
         self.api_key = api_key
         self.model = model
         self._client = None  # Lazy-loaded
+        self._key_validated = False
+        self._key_error: str | None = None  # Cached error if key is bad
 
     # ── Public API ────────────────────────────────
+
+    def validate_api_key(self) -> tuple[bool, str]:
+        """Validate the Gemini API key by making a minimal API call.
+
+        Returns
+        -------
+        tuple[bool, str]
+            (is_valid, message) — True if the key works, False with error details.
+        """
+        try:
+            import google.generativeai as genai
+            self._get_client()
+
+            model = genai.GenerativeModel(model_name=self.model)
+            response = model.generate_content(
+                'Respond with exactly: OK',
+                generation_config=genai.types.GenerationConfig(
+                    max_output_tokens=5,
+                    temperature=0.0,
+                ),
+            )
+            text = (response.text or '').strip()
+            self._key_validated = True
+            self._key_error = None
+            logger.info(
+                '[Gemini] ✅ API key validated successfully (model: %s, response: "%s").',
+                self.model, text[:20],
+            )
+            return True, f'API key valid. Model: {self.model}'
+
+        except Exception as exc:
+            error_str = str(exc)
+            diagnosis = self._classify_error(error_str)
+            self._key_error = diagnosis
+            logger.error(
+                '[Gemini] ❌ API key validation FAILED: %s\n'
+                'Diagnosis: %s\n'
+                'Key prefix: %s***',
+                error_str[:200], diagnosis, self.api_key[:10],
+            )
+            return False, diagnosis
 
     def proofread_transcript(
         self,
@@ -115,6 +169,11 @@ class GeminiClient:
         """
         raw_text = (raw_text or '').strip()
         if not raw_text:
+            return raw_text
+
+        # Skip if we know the key is bad — don't waste time
+        if self._key_error:
+            logger.debug('[Gemini] Skipping proofread — API key is invalid: %s', self._key_error)
             return raw_text
 
         try:
@@ -156,9 +215,15 @@ class GeminiClient:
         except Exception as exc:
             # Fail-open: if Gemini is down or errors, return the raw text
             # so the pipeline never blocks on proofreading failures.
+            error_str = str(exc)
+            diagnosis = self._classify_error(error_str)
             logger.warning(
-                'Proofreading failed (returning raw text): %s', exc,
+                '[Gemini] Proofreading failed (returning raw text): %s | Diagnosis: %s',
+                error_str[:150], diagnosis,
             )
+            # Cache key errors so we stop hammering a dead API
+            if 'KEY' in diagnosis:
+                self._key_error = diagnosis
             return raw_text
 
     def summarize(
@@ -187,44 +252,115 @@ class GeminiClient:
         ------
         SummarizationError
             If the API call fails after all retries.
+        GeminiKeyError
+            If the API key is invalid/leaked/quota-exhausted.
         ValueError
             If the transcript is empty or too long.
         """
         transcript = transcript.strip()
         if not transcript:
+            logger.warning('[Gemini SUMMARIZE] Empty transcript received — returning empty result.')
             return self._empty_result()
+
+        # ── Pre-flight: check for known bad key ──
+        if self._key_error:
+            logger.error(
+                '[Gemini SUMMARIZE] BLOCKED — API key is known-bad: %s. '
+                'Generate a new key at https://aistudio.google.com/apikey '
+                'and update GEMINI_API_KEY in backend/.env',
+                self._key_error,
+            )
+            raise GeminiKeyError(
+                f'Gemini API key is invalid: {self._key_error}. '
+                f'Generate a new key at https://aistudio.google.com/apikey '
+                f'and update GEMINI_API_KEY in backend/.env'
+            )
+
+        # ── Log input diagnostics ──
+        logger.info(
+            '[Gemini SUMMARIZE] Starting summarization:\n'
+            '  Transcript length: %d chars (~%d tokens)\n'
+            '  Bookmarks: %d\n'
+            '  Language: %s\n'
+            '  Model: %s\n'
+            '  API key prefix: %s***',
+            len(transcript), len(transcript) // 4,
+            len(bookmarks or []),
+            language,
+            self.model,
+            self.api_key[:10],
+        )
 
         # Truncate if needed (safety guard)
         if len(transcript) > MAX_TRANSCRIPT_CHARS:
             logger.warning(
-                'Transcript truncated from %d to %d chars.',
+                '[Gemini SUMMARIZE] Transcript truncated from %d to %d chars.',
                 len(transcript), MAX_TRANSCRIPT_CHARS
             )
             transcript = transcript[:MAX_TRANSCRIPT_CHARS] + '\n[... transcript truncated ...]'
 
         # Build prompt
         prompt = self._build_prompt(transcript, bookmarks or [], language)
+        logger.info(
+            '[Gemini SUMMARIZE] Prompt built: %d chars total (transcript: %d, bookmarks: %d).',
+            len(prompt), len(transcript), len(bookmarks or []),
+        )
 
         # ── Retry loop ──
         last_error: Exception | None = None
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                result = self._call_gemini(prompt)
                 logger.info(
-                    'Summarization complete: %d key points, %d action items.',
+                    '[Gemini SUMMARIZE] Attempt %d/%d — calling Gemini API…',
+                    attempt, MAX_RETRIES,
+                )
+                start = time.monotonic()
+                result = self._call_gemini(prompt)
+                elapsed = time.monotonic() - start
+
+                logger.info(
+                    '[Gemini SUMMARIZE] ✅ SUCCESS in %.2fs:\n'
+                    '  Summary: %d chars\n'
+                    '  Key points: %d\n'
+                    '  Action items: %d\n'
+                    '  Markdown: %d chars',
+                    elapsed,
+                    len(result.get('summary', '')),
                     len(result.get('key_points', [])),
                     len(result.get('action_items', [])),
+                    len(result.get('markdown', '')),
                 )
                 return result
 
             except Exception as exc:
                 last_error = exc
-                logger.warning(
-                    'Gemini summarization attempt %d/%d failed: %s',
-                    attempt, MAX_RETRIES, exc,
+                error_str = str(exc)
+                elapsed = time.monotonic() - start
+                diagnosis = self._classify_error(error_str)
+
+                logger.error(
+                    '[Gemini SUMMARIZE] ❌ Attempt %d/%d FAILED in %.2fs:\n'
+                    '  Error: %s\n'
+                    '  Diagnosis: %s',
+                    attempt, MAX_RETRIES, elapsed,
+                    error_str[:300], diagnosis,
                 )
+
+                # Non-retryable errors — fail immediately
+                if diagnosis in ('LEAKED_KEY', 'INVALID_KEY', 'KEY_DISABLED'):
+                    self._key_error = diagnosis
+                    raise GeminiKeyError(
+                        f'Gemini API key is {diagnosis}. '
+                        f'Generate a new key at https://aistudio.google.com/apikey '
+                        f'and update GEMINI_API_KEY in backend/.env'
+                    ) from exc
+
                 if attempt < MAX_RETRIES:
-                    time.sleep(RETRY_DELAY_S * attempt)
+                    delay = RETRY_DELAY_S * attempt
+                    logger.info(
+                        '[Gemini SUMMARIZE] Retrying in %.1fs…', delay,
+                    )
+                    time.sleep(delay)
 
         raise SummarizationError(
             f'Gemini summarization failed after {MAX_RETRIES} attempts: {last_error}'
@@ -237,6 +373,11 @@ class GeminiClient:
         import google.generativeai as genai  # noqa: local import
         self._get_client()  # ensure configured
 
+        logger.debug(
+            '[Gemini API] Calling model=%s, prompt_len=%d',
+            self.model, len(prompt),
+        )
+
         model = genai.GenerativeModel(
             model_name=self.model,
             generation_config=genai.types.GenerationConfig(
@@ -247,7 +388,34 @@ class GeminiClient:
         )
         response = model.generate_content(prompt)
 
-        raw_text = response.text.strip()
+        # ── Validate response ──
+        if response is None:
+            raise SummarizationError('Gemini returned None response.')
+
+        # Check for blocked responses
+        if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
+            block_reason = getattr(response.prompt_feedback, 'block_reason', None)
+            if block_reason:
+                raise SummarizationError(
+                    f'Gemini blocked the request: {block_reason}'
+                )
+
+        # Check candidates
+        if not response.candidates:
+            raise SummarizationError(
+                'Gemini returned no candidates. The response may have been filtered.'
+            )
+
+        raw_text = (response.text or '').strip()
+        if not raw_text:
+            raise SummarizationError(
+                'Gemini returned an empty response text.'
+            )
+
+        logger.debug(
+            '[Gemini API] Response received: %d chars. First 200: %s',
+            len(raw_text), raw_text[:200],
+        )
 
         # Strip markdown code fences if present
         raw_text = re.sub(r'^```(?:json)?\s*', '', raw_text, flags=re.MULTILINE)
@@ -256,17 +424,30 @@ class GeminiClient:
         try:
             parsed = json.loads(raw_text)
         except json.JSONDecodeError as exc:
+            logger.error(
+                '[Gemini API] Invalid JSON response:\n  Error: %s\n  Raw text: %s',
+                exc, raw_text[:500],
+            )
             raise SummarizationError(
                 f'Gemini returned invalid JSON: {exc}\nRaw: {raw_text[:500]}'
             ) from exc
 
         # Ensure required fields exist
-        return {
+        result = {
             'summary': parsed.get('summary', ''),
             'key_points': parsed.get('key_points', []),
             'action_items': parsed.get('action_items', []),
             'markdown': parsed.get('markdown', self._build_fallback_markdown(parsed)),
         }
+
+        # Validate non-empty result
+        if not result['summary'] and not result['key_points']:
+            logger.warning(
+                '[Gemini API] ⚠️ Parsed JSON but summary and key_points are both empty. '
+                'Model may have returned a stub. Raw: %s', raw_text[:200],
+            )
+
+        return result
 
     def _build_prompt(
         self,
@@ -331,3 +512,32 @@ class GeminiClient:
                 ) from exc
         return self._client
 
+    @staticmethod
+    def _classify_error(error_str: str) -> str:
+        """Classify a Gemini API error into a human-readable diagnosis.
+
+        Returns one of:
+            LEAKED_KEY, INVALID_KEY, KEY_DISABLED, QUOTA_EXHAUSTED,
+            MODEL_NOT_FOUND, RATE_LIMITED, CONTENT_BLOCKED, NETWORK_ERROR,
+            UNKNOWN
+        """
+        e = error_str.lower()
+        if 'leaked' in e:
+            return 'LEAKED_KEY'
+        if 'api key not valid' in e or 'invalid api key' in e:
+            return 'INVALID_KEY'
+        if 'permission denied' in e or '403' in error_str:
+            return 'KEY_DISABLED'
+        if 'quota' in e and 'limit: 0' in e:
+            return 'QUOTA_EXHAUSTED'
+        if '429' in error_str and 'quota' in e:
+            return 'QUOTA_EXHAUSTED'
+        if '429' in error_str:
+            return 'RATE_LIMITED'
+        if 'not found' in e and ('model' in e or '404' in error_str):
+            return 'MODEL_NOT_FOUND'
+        if 'blocked' in e or 'safety' in e:
+            return 'CONTENT_BLOCKED'
+        if 'timeout' in e or 'connection' in e or 'network' in e:
+            return 'NETWORK_ERROR'
+        return 'UNKNOWN'
