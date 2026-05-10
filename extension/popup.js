@@ -1,29 +1,31 @@
 /**
- * popup.js — MeetLens v3 Popup Controller
+ * popup.js — MeetLens v3 Side Panel Controller
  *
  * v3 Architecture Changes:
- *   - AudioProcessor now emits raw PCM frames (not WAV blobs)
- *   - ApiClient streams PCM over WebSocket (not REST POST)
+ *   - AudioProcessor now captures BOTH mic + tab audio (dual-stream)
+ *   - Tab audio captures remote participant voices from the active tab
+ *   - ApiClient streams merged PCM over WebSocket (not REST POST)
  *   - Server-side Silero VAD detects sentence boundaries
  *   - Dual display: refined text (primary) + raw Whisper text (secondary)
+ *   - Speaker labels from transcript segments
  *   - Language selector now configures both source and target language
  *
  * Responsibilities:
- *   A. Audio capture via AudioProcessor (continuous PCM streaming)
+ *   A. Audio capture via AudioProcessor (mic + tab audio → merged PCM streaming)
  *   B. WebSocket connection via ApiClient (stream PCM, receive transcripts)
- *   C. Real-time transcript rendering with raw/refined dual view
+ *   C. Real-time transcript rendering with speaker labels and raw/refined dual view
  *   D. Bookmark system (button + Ctrl+Space shortcut)
  *   E. Inline transcript editing
  *   F. Auto-save to chrome.storage.local every 10 seconds
- *   G. Session restore on popup reopen
+ *   G. Session restore on panel reopen
  *   H. Summary panel with Gemini output
  *   I. PDF/Markdown export
  */
 
 'use strict';
 
-import { AudioProcessor } from './audio-processor.js';
-import { ApiClient }       from './api-client.js';
+import { AudioProcessor, releaseCachedTabStream } from './audio-processor.js';
+import { ApiClient }                              from './api-client.js';
 
 // ── Language Map ─────────────────────────────
 const LANGUAGE_NAMES = {
@@ -44,12 +46,16 @@ let timerInterval = null;
 let autosaveInterval = null;
 let segmentCount = 0;
 
-let transcript   = [];   // [{id, timestamp, text, raw_text, bookmarked}]
+let transcript   = [];   // [{id, timestamp, text, raw_text, speaker, bookmarked}]
 let bookmarks    = [];   // [{id, timestamp, text}]
 let summaryData  = null; // {summary, key_points, action_items, markdown}
 
 let processor = null;
 let client    = null;
+
+// Speaker tracking
+let currentSpeaker = 'Speaker 1';
+let speakerHistory = [];  // Track speaker changes for consistency
 
 // ── DOM ───────────────────────────────────────
 const btnStart    = document.getElementById('btnStart');
@@ -78,6 +84,57 @@ const panelBody   = document.getElementById('panelBody');
 const emptyState  = document.getElementById('emptyState');
 const summaryContent= document.getElementById('summaryContent');
 
+// ── Audio Level Meters ────────────────────────
+const audioMeters = document.getElementById('audioMeters');
+const micMeter    = document.getElementById('micMeter');
+const tabMeterEl  = document.getElementById('tabMeter');
+const micLabel    = document.getElementById('micLabel');
+const tabLabelEl  = document.getElementById('tabLabel');
+const micStatus   = document.getElementById('micStatus');
+const tabStatus   = document.getElementById('tabStatus');
+
+let _tabSilenceFrames = 0;   // count silent tab frames to warn user
+
+function updateMeters(micRMS, tabRMS, tabActive) {
+  // Mic bar (always expected to show signal while speaking)
+  const micPct = Math.min(100, Math.round(micRMS * 400));  // scale up for visibility
+  micMeter.style.width = micPct + '%';
+  micMeter.classList.toggle('dead', micPct === 0);
+  micLabel.className   = 'meter-label ' + (micPct > 0 ? 'active' : '');
+  micStatus.textContent = micPct > 5 ? '🔊 live' : 'silent';
+
+  // Tab bar
+  if (!tabActive) {
+    tabMeterEl.style.width  = '0%';
+    tabMeterEl.classList.add('dead');
+    tabLabelEl.className    = 'meter-label inactive';
+    tabStatus.textContent   = '✕ off';
+    return;
+  }
+
+  const tabPct = Math.min(100, Math.round(tabRMS * 400));
+  tabMeterEl.style.width = tabPct + '%';
+  tabMeterEl.classList.remove('dead');
+  tabLabelEl.className   = 'meter-label ' + (tabPct > 0 ? 'active' : '');
+
+  // Track silence to warn user they may have picked wrong tab
+  if (tabPct === 0) {
+    _tabSilenceFrames++;
+    if (_tabSilenceFrames === 50) {  // ~5 seconds of silence
+      tabStatus.textContent = '⚠️ silent';
+      showBanner('warn', '⚠️',
+        'Tab audio is silent. Did you select the correct meeting tab? ' +
+        'Try Stop → Start and pick your Google Meet / Zoom tab.'
+      );
+    } else {
+      tabStatus.textContent = 'waiting…';
+    }
+  } else {
+    _tabSilenceFrames = 0;
+    tabStatus.textContent = '🔊 live';
+  }
+}
+
 // ── Init ──────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
   initApiClient();
@@ -91,7 +148,7 @@ function initApiClient() {
     // onTranscript
     (result) => {
       removeSkeleton();
-      appendTranscript(result.text, result.raw_text, result.pipeline_ms);
+      appendTranscript(result.text, result.raw_text, result.pipeline_ms, result.speaker);
     },
     // onVADEvent
     (event) => {
@@ -167,10 +224,29 @@ async function handleStart() {
     return;
   }
 
-  // 2. Start audio capture — PCM frames are sent directly to WebSocket
+  // 2. Start audio capture — mic + tab audio merged, PCM frames sent to WebSocket
   processor = new AudioProcessor(
-    (pcmBuffer) => client.sendAudio(pcmBuffer),  // Stream PCM directly
+    (pcmBuffer) => client.sendAudio(pcmBuffer),  // Stream merged PCM directly
     (err) => { showBanner('error', '⚠️', err); handleStop(); },
+    (audioInfo) => {
+      if (audioInfo.type === 'levels') {
+        // Real-time level update — drive the meter bars
+        updateMeters(audioInfo.micRMS, audioInfo.tabRMS, audioInfo.tabActive);
+        return;
+      }
+      // Status update (initial or tab-stopped event)
+      if (audioInfo.tabStopped) {
+        showBanner('warn', '⚠️', 'Tab audio sharing stopped — only your microphone is active now.');
+        return;
+      }
+      if (audioInfo.tabActive) {
+        showBanner('success', '🎧', 'Capturing both voices! Your mic + tab audio are being transcribed.');
+      } else {
+        showBanner('warn', '⚠️',
+          'Only microphone captured. To transcribe the other person: Stop → Start → share your meeting tab.'
+        );
+      }
+    },
   );
 
   await processor.start();
@@ -180,13 +256,17 @@ async function handleStart() {
   isPaused     = false;
   sessionStart = Date.now();
   segmentCount = 0;
+  currentSpeaker = 'Speaker 1';
+  speakerHistory = [];
 
   setUIState('recording');
   startTimer();
   startAutosave();
-  hideBanner();
   switchTab('transcript');
-  footerStatus.textContent = 'Streaming audio → Silero VAD…';
+
+  footerStatus.textContent = processor.hasTabAudio
+    ? 'Streaming mic + tab audio → Silero VAD…'
+    : 'Streaming mic audio → Silero VAD… (tab audio unavailable)';
 }
 
 function handleStop() {
@@ -226,7 +306,7 @@ function handlePause() {
 }
 
 // ── Transcript Rendering ──────────────────────
-function appendTranscript(text, rawText = '', pipelineMs = 0) {
+function appendTranscript(text, rawText = '', pipelineMs = 0, speaker = '') {
   text = (text || '').trim();
   if (!text) return;
 
@@ -239,11 +319,15 @@ function appendTranscript(text, rawText = '', pipelineMs = 0) {
     ? formatDuration(Math.floor((tsMs - sessionStart) / 1000))
     : '--:--';
 
+  // Speaker assignment — use backend speaker if provided, otherwise auto-assign
+  const speakerLabel = speaker || currentSpeaker;
+
   const entry = {
     id,
     timestamp: tsLabel,
     text,
     raw_text: rawText,
+    speaker: speakerLabel,
     bookmarked: false,
     pipeline_ms: pipelineMs,
   };
@@ -262,6 +346,12 @@ function renderLine(entry) {
   const line = document.createElement('div');
   line.className = 't-line' + (entry.bookmarked ? ' bookmarked' : '');
   line.id = entry.id;
+
+  // Speaker label
+  const speakerEl = document.createElement('span');
+  speakerEl.className = 't-speaker';
+  speakerEl.textContent = entry.speaker || '';
+  speakerEl.style.cssText = 'font-size:10px; font-weight:600; color:var(--blue2); flex-shrink:0; min-width:60px; margin-top:2px;';
 
   const ts = document.createElement('span');
   ts.className = 't-ts';
@@ -300,6 +390,7 @@ function renderLine(entry) {
   bm.className = 't-bm';
   bm.textContent = '⭐';
 
+  line.appendChild(speakerEl);
   line.appendChild(ts);
   line.appendChild(textEl);
   line.appendChild(bm);
@@ -319,7 +410,7 @@ function createEmptyState() {
   const d = document.createElement('div');
   d.className = 'empty-state';
   d.id = 'emptyState';
-  d.innerHTML = `<div class="empty-icon">🎙️</div><div class="empty-text">Press <strong>Start</strong> to begin transcribing.<br>Audio streams to Silero VAD for sentence detection.</div>`;
+  d.innerHTML = `<div class="empty-icon">🎙️</div><div class="empty-text">Press <strong>Start</strong> to begin transcribing.<br>Both your voice and remote participants will be captured.<br>Audio streams to Silero VAD for sentence detection.</div>`;
   return d;
 }
 
@@ -371,7 +462,10 @@ async function handleSummarize() {
   if (transcript.length === 0) return;
 
   const lang = langSelect.value;
-  const fullText = transcript.map(e => `[${e.timestamp}] ${e.text}`).join('\n');
+  const fullText = transcript.map(e => {
+    const speaker = e.speaker ? `${e.speaker}: ` : '';
+    return `[${e.timestamp}] ${speaker}${e.text}`;
+  }).join('\n');
 
   btnSummarize.disabled = true;
   btnSummarize.innerHTML = '<span class="spinner"></span> Generating…';
@@ -443,7 +537,10 @@ async function handleExport() {
   btnExport.innerHTML = '<span class="spinner"></span>';
 
   try {
-    const fullText = transcript.map(e => `[${e.timestamp}] ${e.text}`).join('\n');
+    const fullText = transcript.map(e => {
+      const speaker = e.speaker ? `${e.speaker}: ` : '';
+      return `[${e.timestamp}] ${speaker}${e.text}`;
+    }).join('\n');
     await client.exportPDF({
       transcript: fullText,
       summary: summaryData?.summary || '',
@@ -474,11 +571,17 @@ async function handleCopyMarkdown() {
 // ── New Session ───────────────────────────────
 async function handleNewSession() {
   if (isRecording) handleStop();
+
+  // Release cached tab stream so the NEXT session prompts fresh
+  releaseCachedTabStream();
+
   transcript  = [];
   bookmarks   = [];
   summaryData = null;
   segmentCount = 0;
   sessionStart = null;
+  currentSpeaker = 'Speaker 1';
+  speakerHistory = [];
   renderAllLines();
   summaryContent.innerHTML = `<div class="empty-state"><div class="empty-icon">✨</div><div class="empty-text">Stop recording and click <strong>Generate Summary</strong>.</div></div>`;
   btnSummarize.disabled = false;
@@ -576,6 +679,19 @@ function setUIState(state) {
   statusLabel.textContent = state === 'idle' ? 'Idle'
     : state === 'paused' ? 'Paused'
     : 'Recording';
+
+  // Show meters during recording/paused, hide when idle
+  audioMeters.classList.toggle('visible', state !== 'idle');
+  if (state === 'idle') {
+    // Reset meters to neutral when stopped
+    micMeter.style.width = '0%';
+    tabMeterEl.style.width = '0%';
+    micStatus.textContent = '–';
+    tabStatus.textContent = '–';
+    micLabel.className = 'meter-label';
+    tabLabelEl.className = 'meter-label';
+    _tabSilenceFrames = 0;
+  }
 }
 
 // ── Tabs ──────────────────────────────────────

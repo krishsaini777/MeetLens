@@ -1,22 +1,25 @@
 /**
- * background.js — MeetLens v2 Service Worker
+ * background.js — MeetLens v3 Service Worker
  *
  * Responsibilities:
- *   1. Relay keyboard shortcut (Ctrl+Space) → popup for bookmarking
- *   2. Forward any cross-context messages as needed
+ *   1. Open side panel when extension icon is clicked
+ *   2. Relay keyboard shortcut (Ctrl+Space) → side panel for bookmarking
  *
- * Note: v2 no longer uses tabCapture or offscreen documents.
- * All audio capture and processing happens in the popup context.
+ * Note: Tab audio capture is handled directly in the side panel via
+ * getDisplayMedia() — no background involvement needed.
  */
+
+chrome.sidePanel
+  .setPanelBehavior({ openPanelOnActionClick: true })
+  .catch((error) => console.error(error));
 
 // ── Keyboard Shortcut Handler ──────────────────
 chrome.commands.onCommand.addListener((command) => {
   if (command === 'bookmark-section') {
-    // Relay bookmark command to the popup
     chrome.runtime.sendMessage({ type: 'BOOKMARK_SHORTCUT' }).catch(() => {
-      // Popup may be closed — ignore
+      // Side panel may be closed — ignore
     });
   }
 });
 
-console.log('[MeetLens BG v2] Service worker loaded.');
+console.log('[MeetLens BG v3] Service worker loaded.');

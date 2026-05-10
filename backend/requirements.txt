@@ -21,6 +21,7 @@ numpy>=1.24.0
 
 # PDF generation
 reportlab==4.2.2
+requests>=2.31.0
 
 # Configuration
 python-dotenv==1.0.1

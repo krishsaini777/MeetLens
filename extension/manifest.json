@@ -5,7 +5,8 @@
   "description": "Real-time meeting transcription with Silero VAD sentence detection, Groq Whisper + LLM refinement, and Gemini-powered summaries.",
   "permissions": [
     "activeTab",
-    "storage"
+    "storage",
+    "sidePanel"
   ],
   "host_permissions": [
     "http://localhost/*",
@@ -15,13 +16,15 @@
     "service_worker": "background.js"
   },
   "action": {
-    "default_popup": "popup.html",
     "default_title": "MeetLens Transcriber",
     "default_icon": {
       "16": "icons/icon16.png",
       "48": "icons/icon48.png",
       "128": "icons/icon128.png"
     }
+  },
+  "side_panel": {
+    "default_path": "popup.html"
   },
   "commands": {
     "bookmark-section": {
