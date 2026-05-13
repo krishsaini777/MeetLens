@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import struct
 import sys
@@ -25,7 +26,7 @@ import time
 import wave
 import zipfile
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator, Dict, List
+from typing import AsyncGenerator, Dict, List, Set
 
 import numpy as np
 import torch
@@ -36,6 +37,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from config import config
+from diarizer import Diarizer
 from gemini_client import GeminiClient, GeminiKeyError, SummarizationError
 from groq_client import GroqClient, TranscriptionError, SUPPORTED_LANGUAGES
 from pdf_generator import PDFGenerator
@@ -78,12 +80,23 @@ def load_vad_model():
 groq_client: GroqClient | None = None
 gemini_client: GeminiClient | None = None
 pdf_generator: PDFGenerator | None = None
+diarizer_instance: Diarizer | None = None
+
+# ── Diarization Session State ─────────────────
+# Maps biometric IDs (e.g., "SPEAKER_00") → display names
+session_speaker_map: Dict[str, str] = {}
+# Tracks biometric IDs that the user has manually renamed
+user_renamed_speakers: Set[str] = set()
+# Auto-increment counter for unnamed speakers
+_unnamed_speaker_counter = 0
+# All connected WebSockets (for broadcasting rename events)
+connected_websockets: Set[WebSocket] = set()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Startup / shutdown lifecycle manager."""
-    global groq_client, gemini_client, pdf_generator
+    global groq_client, gemini_client, pdf_generator, diarizer_instance
 
     logger.info(
         'Starting MeetLens v3 backend on %s:%d …',
@@ -104,6 +117,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         model=config.GEMINI_MODEL,
     )
     pdf_generator = PDFGenerator()
+    diarizer_instance = Diarizer(auth_token=config.PYANNOTE_AUTH_TOKEN)
 
     # ── Validate Gemini API key at startup ──────────────────────────
     # This catches leaked / revoked / quota-exhausted keys immediately
@@ -452,159 +466,195 @@ def pcm_to_wav_bytes(pcm_float32: np.ndarray, sample_rate: int = 16000) -> bytes
     return buf.getvalue()
 
 
-@app.websocket('/ws/transcribe')
-async def websocket_transcribe(ws: WebSocket):
-    """WebSocket endpoint for real-time VAD-driven transcription.
+# ── Helper: resolve speaker name from raw_id ──
+def _resolve_speaker(raw_id: str) -> str:
+    """Look up display name for a biometric ID, assigning a new one if needed."""
+    global _unnamed_speaker_counter
+    if raw_id in session_speaker_map:
+        return session_speaker_map[raw_id]
+    _unnamed_speaker_counter += 1
+    name = f'Speaker {_unnamed_speaker_counter}'
+    session_speaker_map[raw_id] = name
+    return name
 
-    Protocol:
-        Client → Server: Binary frames of raw PCM (int16, 16kHz, mono)
-                         OR JSON text frames for configuration:
-                         {"type": "config", "language": "en", "target_language": "English"}
-        Server → Client: JSON text frames:
-                         {"type": "transcript", "text": "...", "raw_text": "...", ...}
-                         {"type": "vad_event", "event": "speech_start"|"speech_end"}
-                         {"type": "error", "message": "..."}
-    """
+
+async def _broadcast(message: dict):
+    """Send a JSON message to all connected WebSockets."""
+    dead = set()
+    for ws in connected_websockets:
+        try:
+            await ws.send_json(message)
+        except Exception:
+            dead.add(ws)
+    connected_websockets.difference_update(dead)
+
+
+async def _handle_text_frame(ws, text, src_lang, tgt_lang, label):
+    """Handle config/ping/rename. Returns True if handled."""
+    try:
+        msg = json.loads(text)
+    except Exception as e:
+        logger.warning('[%s] Bad text frame: %s', label, e)
+        return True
+
+    t = msg.get('type', '')
+    if t == 'config':
+        src_lang[0] = msg.get('language', src_lang[0])
+        tl = msg.get('target_language', '')
+        if tl:
+            tgt_lang[0] = tl
+        logger.info('[%s] Config: source=%s, target=%s', label, src_lang[0], tgt_lang[0])
+        await ws.send_json({'type': 'config_ack', 'language': src_lang[0], 'target_language': tgt_lang[0]})
+        return True
+    if t == 'ping':
+        await ws.send_json({'type': 'pong'})
+        return True
+    if t == 'rename_speaker':
+        raw_id = msg.get('raw_id', '')
+        new_name = msg.get('new_name', '')
+        if raw_id and new_name:
+            session_speaker_map[raw_id] = new_name
+            user_renamed_speakers.add(raw_id)
+            logger.info('[%s] Renamed: %s → %s', label, raw_id, new_name)
+            await _broadcast({'type': 'speaker_renamed', 'raw_id': raw_id, 'new_name': new_name})
+        return True
+    return False
+
+
+@app.websocket('/ws/transcribe/local')
+async def websocket_transcribe_local(ws: WebSocket):
+    """Local mic WebSocket — speaker is always 'Me'. No diarization."""
     await ws.accept()
-    logger.info('[WS] Client connected for transcription.')
+    connected_websockets.add(ws)
+    logger.info('[WS-LOCAL] Client connected.')
 
-    # Per-session state
     session = VADSession(
-        sample_rate=config.AUDIO_SAMPLE_RATE,
-        threshold=config.VAD_THRESHOLD,
-        min_silence_ms=config.VAD_MIN_SILENCE_MS,
-        min_speech_ms=config.VAD_MIN_SPEECH_MS,
+        sample_rate=config.AUDIO_SAMPLE_RATE, threshold=config.VAD_THRESHOLD,
+        min_silence_ms=config.VAD_MIN_SILENCE_MS, min_speech_ms=config.VAD_MIN_SPEECH_MS,
         max_speech_s=config.VAD_MAX_SPEECH_S,
     )
-    source_language = config.DEFAULT_LANGUAGE
-    target_language_name = SUPPORTED_LANGUAGES.get(
-        config.TARGET_LANGUAGE, 'English'
-    )
-    segment_count = 0
+    src_lang = [config.DEFAULT_LANGUAGE]
+    tgt_lang = [SUPPORTED_LANGUAGES.get(config.TARGET_LANGUAGE, 'English')]
+    seg = 0
 
     try:
         while True:
             data = await ws.receive()
-
-            # Handle text frames (configuration messages)
             if 'text' in data:
-                import json
-                try:
-                    msg = json.loads(data['text'])
-                    if msg.get('type') == 'config':
-                        source_language = msg.get('language', source_language)
-                        tl = msg.get('target_language', '')
-                        if tl:
-                            target_language_name = tl
-                        logger.info(
-                            '[WS] Config updated: source=%s, target=%s',
-                            source_language, target_language_name,
-                        )
-                        await ws.send_json({
-                            'type': 'config_ack',
-                            'language': source_language,
-                            'target_language': target_language_name,
-                        })
-                    elif msg.get('type') == 'ping':
-                        await ws.send_json({'type': 'pong'})
-                except Exception as e:
-                    logger.warning('[WS] Bad text frame: %s', e)
-                continue
-
-            # Handle binary frames (PCM audio)
+                if await _handle_text_frame(ws, data['text'], src_lang, tgt_lang, 'WS-LOCAL'):
+                    continue
             if 'bytes' in data:
                 raw_bytes = data['bytes']
                 if not raw_bytes:
                     continue
-
-                # Decode int16 PCM → float32
                 try:
-                    pcm_int16 = np.frombuffer(raw_bytes, dtype=np.int16)
-                    pcm_float32 = pcm_int16.astype(np.float32) / 32768.0
-                except Exception as e:
-                    logger.warning('[WS] Bad PCM data: %s', e)
+                    pcm_f32 = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                except Exception:
                     continue
-
-                # Feed to VAD — get any completed speech segments
-                segments = session.feed_pcm(pcm_float32)
-
-                for segment in segments:
-                    segment_count += 1
-                    duration_s = len(segment) / config.AUDIO_SAMPLE_RATE
-
-                    # Notify client that a sentence was detected
-                    await ws.send_json({
-                        'type': 'vad_event',
-                        'event': 'speech_end',
-                        'segment_id': segment_count,
-                        'duration_s': round(duration_s, 2),
-                    })
-
-                    # Run transcription pipeline in a thread to avoid
-                    # blocking the WebSocket event loop
+                for segment in session.feed_pcm(pcm_f32):
+                    seg += 1
+                    dur = len(segment) / config.AUDIO_SAMPLE_RATE
+                    await ws.send_json({'type': 'vad_event', 'event': 'speech_end', 'segment_id': seg, 'duration_s': round(dur, 2)})
                     wav_bytes = pcm_to_wav_bytes(segment, config.AUDIO_SAMPLE_RATE)
-
                     try:
                         result = await asyncio.get_event_loop().run_in_executor(
-                            None,
-                            groq_client.transcribe_and_refine,
-                            wav_bytes,
-                            source_language,
-                            target_language_name,
-                            f'segment_{segment_count}.wav',
+                            None, groq_client.transcribe_and_refine, wav_bytes, src_lang[0], tgt_lang[0], f'local_{seg}.wav', config.WHISPER_CUSTOM_VOCABULARY,
                         )
-
                         if result['text']:
                             await ws.send_json({
-                                'type': 'transcript',
-                                'segment_id': segment_count,
-                                'text': result['text'],
-                                'raw_text': result.get('raw_text', ''),
-                                'language': result.get('language', source_language),
-                                'duration': result.get('duration', duration_s),
+                                'type': 'transcript', 'segment_id': seg,
+                                'text': result['text'], 'raw_text': result.get('raw_text', ''),
+                                'language': result.get('language', src_lang[0]),
+                                'duration': result.get('duration', dur),
                                 'pipeline_ms': result.get('pipeline_ms', 0),
                                 'llm_model': result.get('llm_model', ''),
+                                'speaker': 'Me', 'raw_id': 'LOCAL',
                             })
-
-                    except (TranscriptionError, Exception) as e:
-                        logger.error('[WS] Transcription error: %s', e)
-                        await ws.send_json({
-                            'type': 'error',
-                            'message': f'Transcription failed: {str(e)[:200]}',
-                            'segment_id': segment_count,
-                        })
-
+                    except Exception as e:
+                        logger.error('[WS-LOCAL] Transcription error: %s', e)
+                        await ws.send_json({'type': 'error', 'message': str(e)[:200], 'segment_id': seg})
     except WebSocketDisconnect:
-        logger.info('[WS] Client disconnected.')
-        # Flush any remaining audio
-        remaining = session.flush()
-        for segment in remaining:
-            segment_count += 1
-            wav_bytes = pcm_to_wav_bytes(segment, config.AUDIO_SAMPLE_RATE)
-            try:
-                result = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    groq_client.transcribe_and_refine,
-                    wav_bytes,
-                    source_language,
-                    target_language_name,
-                    f'segment_{segment_count}.wav',
-                )
-                if result['text']:
-                    logger.info(
-                        '[WS] Flushed final segment: "%s"', result['text'][:80]
-                    )
-            except Exception:
-                pass
+        logger.info('[WS-LOCAL] Disconnected.')
+        session.flush()
     except Exception as e:
-        logger.error('[WS] Unexpected error: %s', e, exc_info=True)
-        try:
-            await ws.send_json({
-                'type': 'error',
-                'message': f'Server error: {str(e)[:200]}',
-            })
-        except Exception:
-            pass
+        logger.error('[WS-LOCAL] Error: %s', e, exc_info=True)
+    finally:
+        connected_websockets.discard(ws)
+
+
+@app.websocket('/ws/transcribe/remote')
+async def websocket_transcribe_remote(ws: WebSocket):
+    """Remote tab audio WebSocket — Pyannote diarization + DOM speaker auto-mapping."""
+    await ws.accept()
+    connected_websockets.add(ws)
+    logger.info('[WS-REMOTE] Client connected.')
+
+    session = VADSession(
+        sample_rate=config.AUDIO_SAMPLE_RATE, threshold=config.VAD_THRESHOLD,
+        min_silence_ms=config.VAD_MIN_SILENCE_MS, min_speech_ms=config.VAD_MIN_SPEECH_MS,
+        max_speech_s=config.VAD_MAX_SPEECH_S,
+    )
+    src_lang = [config.DEFAULT_LANGUAGE]
+    tgt_lang = [SUPPORTED_LANGUAGES.get(config.TARGET_LANGUAGE, 'English')]
+    seg = 0
+    current_dom_speaker = None
+
+    try:
+        while True:
+            data = await ws.receive()
+            if 'text' in data:
+                try:
+                    msg = json.loads(data['text'])
+                    if msg.get('type') == 'metadata':
+                        current_dom_speaker = msg.get('dom_speaker')
+                        continue
+                except Exception:
+                    pass
+                if await _handle_text_frame(ws, data['text'], src_lang, tgt_lang, 'WS-REMOTE'):
+                    continue
+            if 'bytes' in data:
+                raw_bytes = data['bytes']
+                if not raw_bytes:
+                    continue
+                try:
+                    pcm_f32 = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                except Exception:
+                    continue
+                for segment in session.feed_pcm(pcm_f32):
+                    seg += 1
+                    dur = len(segment) / config.AUDIO_SAMPLE_RATE
+                    await ws.send_json({'type': 'vad_event', 'event': 'speech_end', 'segment_id': seg, 'duration_s': round(dur, 2)})
+                    wav_bytes = pcm_to_wav_bytes(segment, config.AUDIO_SAMPLE_RATE)
+                    loop = asyncio.get_event_loop()
+                    try:
+                        raw_id, result = await asyncio.gather(
+                            loop.run_in_executor(None, diarizer_instance.get_speaker, segment, config.AUDIO_SAMPLE_RATE),
+                            loop.run_in_executor(None, groq_client.transcribe_and_refine, wav_bytes, src_lang[0], tgt_lang[0], f'remote_{seg}.wav', config.WHISPER_CUSTOM_VOCABULARY),
+                        )
+                        if current_dom_speaker and raw_id != 'UNKNOWN':
+                            if raw_id not in user_renamed_speakers:
+                                session_speaker_map[raw_id] = current_dom_speaker
+                        speaker_name = _resolve_speaker(raw_id)
+                        if result['text']:
+                            await ws.send_json({
+                                'type': 'transcript', 'segment_id': seg,
+                                'text': result['text'], 'raw_text': result.get('raw_text', ''),
+                                'language': result.get('language', src_lang[0]),
+                                'duration': result.get('duration', dur),
+                                'pipeline_ms': result.get('pipeline_ms', 0),
+                                'llm_model': result.get('llm_model', ''),
+                                'speaker': speaker_name, 'raw_id': raw_id,
+                            })
+                    except Exception as e:
+                        logger.error('[WS-REMOTE] Pipeline error: %s', e)
+                        await ws.send_json({'type': 'error', 'message': str(e)[:200], 'segment_id': seg})
+    except WebSocketDisconnect:
+        logger.info('[WS-REMOTE] Disconnected.')
+        session.flush()
+    except Exception as e:
+        logger.error('[WS-REMOTE] Error: %s', e, exc_info=True)
+    finally:
+        connected_websockets.discard(ws)
 
 
 # ──────────────────────────────────────────────

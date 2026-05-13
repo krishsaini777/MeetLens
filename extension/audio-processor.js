@@ -1,23 +1,26 @@
 /**
- * audio-processor.js — MeetLens v3 Dual-Stream Audio Capture
+ * audio-processor.js — MeetLens v4 Dual-Stream Audio Capture
  *
  * KEY DESIGN:
  *  - Tab stream is cached at module level (only prompts ONCE per session)
+ *  - TWO independent capture chains: mic (local) and tab (remote)
+ *  - Each chain has its own ScriptProcessorNode emitting separate PCM frames
  *  - AnalyserNodes measure actual RMS levels from mic and tab separately
  *  - Level data emitted via onAudioInfo callback so UI can show meters
- *  - Proper summing: both sources feed the same ScriptProcessorNode
  *
- * AUDIO GRAPH:
+ * v4 AUDIO GRAPH (Dual-Stream):
  *
- *  Mic ──▶ micGain ──▶ ┐
- *                       ├──▶ ScriptProcessor ──▶ destination (keeps it alive)
- *  Tab ──▶ tabGain ──▶ ┘         │
- *                                 └──▶ PCM frames ──▶ WebSocket
+ *  Mic ──▶ micGain ──▶ micProcessor ──▶ destination
+ *                │           │
+ *                │           └──▶ PCM frames ──▶ onLocalFrame (→ local WS)
+ *                └──▶ micAnalyser
+ *
+ *  Tab ──▶ tabGain ──▶ tabProcessor ──▶ destination
+ *                │           │
+ *                │           └──▶ PCM frames ──▶ onRemoteFrame (→ remote WS)
+ *                └──▶ tabAnalyser
  *
  *  Tab ──▶ tabPlayback ──▶ destination  (restores muted playback)
- *
- *  Mic ──▶ micAnalyser  ┐
- *  Tab ──▶ tabAnalyser  ┘  (level meters, emitted every 100ms)
  */
 
 'use strict';
@@ -46,29 +49,38 @@ export function releaseCachedTabStream() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export class AudioProcessor {
-  constructor(onPCMFrame, onError, onAudioInfo = null) {
-    this._onPCMFrame  = onPCMFrame;
-    this._onError     = onError;
-    this._onAudioInfo = onAudioInfo;
+  /**
+   * @param {function(ArrayBuffer): void}  onLocalFrame   PCM frames from mic (→ local WS)
+   * @param {function(ArrayBuffer): void}  onRemoteFrame  PCM frames from tab (→ remote WS)
+   * @param {function(string): void}       onError        Error callback
+   * @param {function(object): void}       onAudioInfo    Audio status/levels callback
+   */
+  constructor(onLocalFrame, onRemoteFrame, onError, onAudioInfo = null) {
+    this._onLocalFrame  = onLocalFrame;
+    this._onRemoteFrame = onRemoteFrame;
+    this._onError       = onError;
+    this._onAudioInfo   = onAudioInfo;
 
-    this._audioCtx      = null;
-    this._micStream     = null;
-    this._micSource     = null;
-    this._tabSource     = null;
-    this._micGain       = null;
-    this._tabGain       = null;
-    this._tabPlayback   = null;
-    this._micAnalyser   = null;
-    this._tabAnalyser   = null;
-    this._processorNode = null;
+    this._audioCtx        = null;
+    this._micStream       = null;
+    this._micSource       = null;
+    this._tabSource       = null;
+    this._micGain         = null;
+    this._tabGain         = null;
+    this._tabPlayback     = null;
+    this._micAnalyser     = null;
+    this._tabAnalyser     = null;
+    this._micProcessorNode  = null;
+    this._tabProcessorNode  = null;
 
     this._isPaused    = false;
     this._isRunning   = false;
     this._hasTabAudio = false;
 
-    this._accumulator  = [];
-    this._levelTimer   = null;
-    this._diagInterval = null;
+    this._micAccumulator  = [];
+    this._tabAccumulator  = [];
+    this._levelTimer      = null;
+    this._diagInterval    = null;
 
     // Level buffers for AnalyserNodes
     this._micLevelBuf = null;
@@ -157,7 +169,7 @@ export class AudioProcessor {
       const micSettings = micTrack?.getSettings() ?? {};
       console.log(`[AudioProcessor] ✅ Mic: ${micSettings.sampleRate ?? '?'} Hz — ${micTrack?.label ?? 'unnamed'}`);
 
-      // ── Step 3: Build AudioContext graph ─────────────────────────────────
+      // ── Step 3: Build AudioContext with DUAL capture chains ─────────────
       this._audioCtx = new AudioContext({ sampleRate: TARGET_SAMPLE_RATE });
 
       // Sources
@@ -179,21 +191,27 @@ export class AudioProcessor {
       this._tabAnalyser.fftSize = 256;
       this._tabLevelBuf = new Float32Array(this._tabAnalyser.fftSize);
 
-      // ScriptProcessor for PCM extraction
-      this._processorNode = this._audioCtx.createScriptProcessor(4096, 1, 1);
-      this._processorNode.onaudioprocess = e => this._onAudioProcess(e);
+      // ── Mic ScriptProcessor (LOCAL stream) ────────────────────────────
+      this._micProcessorNode = this._audioCtx.createScriptProcessor(4096, 1, 1);
+      this._micProcessorNode.onaudioprocess = e => this._onMicAudioProcess(e);
 
-      // Wire mic
+      // Wire mic chain
       this._micSource.connect(this._micGain);
-      this._micGain.connect(this._processorNode);      // → recording
-      this._micGain.connect(this._micAnalyser);        // → level meter
+      this._micGain.connect(this._micProcessorNode);     // → local PCM capture
+      this._micGain.connect(this._micAnalyser);           // → level meter
+      this._micProcessorNode.connect(this._audioCtx.destination); // keeps it alive
 
-      // Wire tab audio
+      // ── Tab ScriptProcessor (REMOTE stream) ───────────────────────────
       if (this._hasTabAudio && _cachedTabStream) {
         this._tabSource = this._audioCtx.createMediaStreamSource(_cachedTabStream);
+        this._tabProcessorNode = this._audioCtx.createScriptProcessor(4096, 1, 1);
+        this._tabProcessorNode.onaudioprocess = e => this._onTabAudioProcess(e);
+
+        // Wire tab chain
         this._tabSource.connect(this._tabGain);
-        this._tabGain.connect(this._processorNode);    // → recording
-        this._tabGain.connect(this._tabAnalyser);      // → level meter
+        this._tabGain.connect(this._tabProcessorNode);     // → remote PCM capture
+        this._tabGain.connect(this._tabAnalyser);           // → level meter
+        this._tabProcessorNode.connect(this._audioCtx.destination); // keeps it alive
 
         // Re-enable playback (getDisplayMedia may mute the source tab)
         this._tabPlayback = this._audioCtx.createGain();
@@ -201,17 +219,14 @@ export class AudioProcessor {
         this._tabSource.connect(this._tabPlayback);
         this._tabPlayback.connect(this._audioCtx.destination);
 
-        console.log('[AudioProcessor] ✅ Tab wired: → recorder + → analyser + → speakers');
+        console.log('[AudioProcessor] ✅ Tab wired: → remote recorder + → analyser + → speakers');
       } else {
-        // Connect tabAnalyser to nothing so it stays quiet (reads as zero)
         console.log('[AudioProcessor] Tab audio not available — mic only.');
       }
 
-      // Processor must connect to destination to keep onaudioprocess firing
-      this._processorNode.connect(this._audioCtx.destination);
-
-      this._isRunning   = true;
-      this._accumulator = [];
+      this._isRunning       = true;
+      this._micAccumulator  = [];
+      this._tabAccumulator  = [];
 
       // Start emitting level data
       this._startLevelTimer();
@@ -226,7 +241,7 @@ export class AudioProcessor {
         micLabel:          micTrack?.label ?? 'unknown',
         tabLabel:          _cachedTabStream?.getAudioTracks()[0]?.label ?? 'none',
       };
-      console.log(`[AudioProcessor] ✅ Mode: ${this._hasTabAudio ? 'DUAL (mic+tab)' : 'MIC ONLY ⚠️'}`);
+      console.log(`[AudioProcessor] ✅ Mode: ${this._hasTabAudio ? 'DUAL (mic→local, tab→remote)' : 'MIC ONLY ⚠️'}`);
       if (this._onAudioInfo) this._onAudioInfo(info);
 
     } catch (err) {
@@ -244,7 +259,8 @@ export class AudioProcessor {
 
   resume() {
     this._isPaused = false;
-    this._accumulator = [];
+    this._micAccumulator = [];
+    this._tabAccumulator = [];
     console.log('[AudioProcessor] Resumed.');
   }
 
@@ -255,20 +271,23 @@ export class AudioProcessor {
   stop() {
     this._isRunning = false;
     this._isPaused  = false;
-    this._accumulator = [];
+    this._micAccumulator = [];
+    this._tabAccumulator = [];
 
     if (this._levelTimer)   { clearInterval(this._levelTimer);   this._levelTimer   = null; }
     if (this._diagInterval) { clearInterval(this._diagInterval); this._diagInterval = null; }
 
     const nodes = [
-      this._processorNode, this._micGain, this._tabGain,
+      this._micProcessorNode, this._tabProcessorNode,
+      this._micGain, this._tabGain,
       this._tabPlayback, this._micAnalyser, this._tabAnalyser,
       this._micSource, this._tabSource,
     ];
     for (const n of nodes) {
       if (n) try { n.disconnect(); } catch (_) { /**/ }
     }
-    this._processorNode = this._micGain = this._tabGain = null;
+    this._micProcessorNode = this._tabProcessorNode = null;
+    this._micGain = this._tabGain = null;
     this._tabPlayback = this._micAnalyser = this._tabAnalyser = null;
     this._micSource = this._tabSource = null;
 
@@ -291,17 +310,31 @@ export class AudioProcessor {
   get isPaused()    { return this._isPaused; }
   get hasTabAudio() { return this._hasTabAudio; }
 
-  // ── Private ───────────────────────────────────────────────────────────────
+  // ── Private — Mic (Local) Audio Processing ──────────────────────────────────
 
-  _onAudioProcess(event) {
+  _onMicAudioProcess(event) {
     if (!this._isRunning || this._isPaused) return;
     const input = event.inputBuffer.getChannelData(0);
-    for (let i = 0; i < input.length; i++) this._accumulator.push(input[i]);
-    while (this._accumulator.length >= SAMPLES_PER_FRAME) {
-      const frame = this._accumulator.splice(0, SAMPLES_PER_FRAME);
-      this._onPCMFrame(this._float32ToInt16(frame));
+    for (let i = 0; i < input.length; i++) this._micAccumulator.push(input[i]);
+    while (this._micAccumulator.length >= SAMPLES_PER_FRAME) {
+      const frame = this._micAccumulator.splice(0, SAMPLES_PER_FRAME);
+      this._onLocalFrame(this._float32ToInt16(frame));
     }
   }
+
+  // ── Private — Tab (Remote) Audio Processing ─────────────────────────────────
+
+  _onTabAudioProcess(event) {
+    if (!this._isRunning || this._isPaused) return;
+    const input = event.inputBuffer.getChannelData(0);
+    for (let i = 0; i < input.length; i++) this._tabAccumulator.push(input[i]);
+    while (this._tabAccumulator.length >= SAMPLES_PER_FRAME) {
+      const frame = this._tabAccumulator.splice(0, SAMPLES_PER_FRAME);
+      this._onRemoteFrame(this._float32ToInt16(frame));
+    }
+  }
+
+  // ── Private — Shared Utilities ──────────────────────────────────────────────
 
   _float32ToInt16(samples) {
     const buf  = new ArrayBuffer(samples.length * 2);

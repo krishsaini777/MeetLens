@@ -78,6 +78,11 @@ class Config:
         default_factory=lambda: float(os.getenv('VAD_MAX_SPEECH_S', '30.0'))
     )
 
+    # ── Speaker Diarization ───────────────────────
+    PYANNOTE_AUTH_TOKEN: str = field(
+        default_factory=lambda: os.getenv('PYANNOTE_AUTH_TOKEN', '')
+    )
+
     # ── Server ────────────────────────────────────
     BACKEND_HOST: str = field(
         default_factory=lambda: os.getenv('BACKEND_HOST', 'localhost')

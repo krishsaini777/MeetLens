@@ -1,13 +1,13 @@
 /**
- * popup.js — MeetLens v3 Side Panel Controller
+ * popup.js — MeetLens v4 Side Panel Controller
  *
- * v3 Architecture Changes:
- *   - AudioProcessor now captures BOTH mic + tab audio (dual-stream)
- *   - Tab audio captures remote participant voices from the active tab
- *   - ApiClient streams merged PCM over WebSocket (not REST POST)
+ * v4 Architecture Changes:
+ *   - Dual-stream audio: mic (local WS) + tab (remote WS) — zero corruption
+ *   - DOM scraper provides active speaker name from meeting platform
+ *   - Pyannote diarization on remote stream, auto-mapped to DOM names
+ *   - Clickable speaker labels with rename support
  *   - Server-side Silero VAD detects sentence boundaries
  *   - Dual display: refined text (primary) + raw Whisper text (secondary)
- *   - Speaker labels from transcript segments
  *   - Language selector now configures both source and target language
  *
  * Responsibilities:
@@ -46,7 +46,7 @@ let timerInterval = null;
 let autosaveInterval = null;
 let segmentCount = 0;
 
-let transcript   = [];   // [{id, timestamp, text, raw_text, speaker, bookmarked}]
+let transcript   = [];   // [{id, timestamp, text, raw_text, speaker, raw_id, bookmarked}]
 let bookmarks    = [];   // [{id, timestamp, text}]
 let summaryData  = null; // {summary, key_points, action_items, markdown}
 
@@ -56,6 +56,9 @@ let client    = null;
 // Speaker tracking
 let currentSpeaker = 'Speaker 1';
 let speakerHistory = [];  // Track speaker changes for consistency
+
+// DOM-scraped active speaker from content script (Phase 1 → Phase 2 bridge)
+let currentDomSpeaker = null;
 
 // ── DOM ───────────────────────────────────────
 const btnStart    = document.getElementById('btnStart');
@@ -148,13 +151,13 @@ function initApiClient() {
     // onTranscript
     (result) => {
       removeSkeleton();
-      appendTranscript(result.text, result.raw_text, result.pipeline_ms, result.speaker);
+      appendTranscript(result.text, result.raw_text, result.pipeline_ms, result.speaker, result.raw_id);
     },
     // onVADEvent
     (event) => {
       if (event.event === 'speech_end') {
         showSkeleton();
-        footerStatus.textContent = `segment #${event.segment_id} detected (${event.duration_s}s)…`;
+        footerStatus.textContent = `segment #${event.segment_id} detected (${event.duration_s}s) [${event.source}]…`;
       }
     },
     // onError
@@ -168,6 +171,10 @@ function initApiClient() {
       } else if (status === 'connection lost') {
         statusPill.classList.add('offline');
       }
+    },
+    // onSpeakerRenamed — broadcast from backend
+    (data) => {
+      handleSpeakerRenamed(data.raw_id, data.new_name);
     },
   );
 }
@@ -197,8 +204,24 @@ function bindEvents() {
   });
 
   // Bookmark shortcut from background.js (Ctrl+Space relay)
+  // + DOM speaker updates from content script via background relay
   chrome.runtime.onMessage.addListener((msg) => {
     if (msg.type === 'BOOKMARK_SHORTCUT' && isRecording) handleBookmark();
+    if (msg.type === 'ACTIVE_DOM_SPEAKER') {
+      currentDomSpeaker = msg.name || null;
+    }
+  });
+
+  // ── Click-to-Rename Speaker (Phase 4) ────────────────────
+  document.addEventListener('click', (e) => {
+    const label = e.target.closest('.speaker-label');
+    if (!label) return;
+    const rawId = label.dataset.rawId;
+    const currentName = label.textContent;
+    const newName = prompt('Rename this speaker:', currentName);
+    if (newName && newName.trim() && newName.trim() !== currentName) {
+      client.renameSpeaker(rawId, newName.trim());
+    }
   });
 }
 
@@ -224,33 +247,36 @@ async function handleStart() {
     return;
   }
 
-  // 2. Start audio capture — mic + tab audio merged, PCM frames sent to WebSocket
+  // 2. Start audio capture — dual-stream: mic → local WS, tab → remote WS
   processor = new AudioProcessor(
-    (pcmBuffer) => client.sendAudio(pcmBuffer),  // Stream merged PCM directly
+    // onLocalFrame — mic PCM → local WebSocket
+    (pcmBuffer) => client.sendLocalAudio(pcmBuffer),
+    // onRemoteFrame — tab PCM → remote WebSocket (with DOM speaker metadata)
+    (pcmBuffer) => client.sendRemoteAudio(pcmBuffer, currentDomSpeaker),
+    // onError
     (err) => { showBanner('error', '⚠️', err); handleStop(); },
+    // onAudioInfo
     (audioInfo) => {
       if (audioInfo.type === 'levels') {
-        // Real-time level update — drive the meter bars
         updateMeters(audioInfo.micRMS, audioInfo.tabRMS, audioInfo.tabActive);
         return;
       }
-      // Status update (initial or tab-stopped event)
       if (audioInfo.tabStopped) {
         showBanner('warn', '⚠️', 'Tab audio sharing stopped — only your microphone is active now.');
         return;
       }
       if (audioInfo.tabActive) {
-        showBanner('success', '🎧', 'Capturing both voices! Your mic + tab audio are being transcribed.');
+        showBanner('success', '🎧', 'Dual-stream active! Mic → local WS, Tab → remote WS.');
       } else {
         showBanner('warn', '⚠️',
-          'Only microphone captured. To transcribe the other person: Stop → Start → share your meeting tab.'
+          'Only microphone captured. To transcribe others: Stop → Start → share your meeting tab.'
         );
       }
     },
   );
 
   await processor.start();
-  if (!processor.isRunning) return; // error already shown
+  if (!processor.isRunning) return;
 
   isRecording  = true;
   isPaused     = false;
@@ -258,6 +284,7 @@ async function handleStart() {
   segmentCount = 0;
   currentSpeaker = 'Speaker 1';
   speakerHistory = [];
+  currentDomSpeaker = null;
 
   setUIState('recording');
   startTimer();
@@ -265,8 +292,8 @@ async function handleStart() {
   switchTab('transcript');
 
   footerStatus.textContent = processor.hasTabAudio
-    ? 'Streaming mic + tab audio → Silero VAD…'
-    : 'Streaming mic audio → Silero VAD… (tab audio unavailable)';
+    ? 'Dual-stream: mic → local WS, tab → remote WS'
+    : 'Mic only → local WS (tab audio unavailable)';
 }
 
 function handleStop() {
@@ -306,7 +333,7 @@ function handlePause() {
 }
 
 // ── Transcript Rendering ──────────────────────
-function appendTranscript(text, rawText = '', pipelineMs = 0, speaker = '') {
+function appendTranscript(text, rawText = '', pipelineMs = 0, speaker = '', rawId = '') {
   text = (text || '').trim();
   if (!text) return;
 
@@ -328,6 +355,7 @@ function appendTranscript(text, rawText = '', pipelineMs = 0, speaker = '') {
     text,
     raw_text: rawText,
     speaker: speakerLabel,
+    raw_id: rawId || '',
     bookmarked: false,
     pipeline_ms: pipelineMs,
   };
@@ -347,11 +375,12 @@ function renderLine(entry) {
   line.className = 't-line' + (entry.bookmarked ? ' bookmarked' : '');
   line.id = entry.id;
 
-  // Speaker label
+  // Speaker label — clickable for rename (Phase 4)
   const speakerEl = document.createElement('span');
-  speakerEl.className = 't-speaker';
+  speakerEl.className = 't-speaker speaker-label';
   speakerEl.textContent = entry.speaker || '';
-  speakerEl.style.cssText = 'font-size:10px; font-weight:600; color:var(--blue2); flex-shrink:0; min-width:60px; margin-top:2px;';
+  speakerEl.dataset.rawId = entry.raw_id || '';
+  speakerEl.style.cssText = 'font-size:10px; font-weight:600; color:var(--blue2); flex-shrink:0; min-width:60px; margin-top:2px; cursor:pointer; border-bottom:1px dashed gray;';
 
   const ts = document.createElement('span');
   ts.className = 't-ts';
@@ -582,6 +611,7 @@ async function handleNewSession() {
   sessionStart = null;
   currentSpeaker = 'Speaker 1';
   speakerHistory = [];
+  currentDomSpeaker = null;
   renderAllLines();
   summaryContent.innerHTML = `<div class="empty-state"><div class="empty-icon">✨</div><div class="empty-text">Stop recording and click <strong>Generate Summary</strong>.</div></div>`;
   btnSummarize.disabled = false;
@@ -719,4 +749,23 @@ function escapeHtml(str) {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
+}
+
+// ── Speaker Rename Handler (Phase 4) ──────────
+function handleSpeakerRenamed(rawId, newName) {
+  if (!rawId || !newName) return;
+
+  // Update all historical transcript entries
+  transcript.forEach(entry => {
+    if (entry.raw_id === rawId) {
+      entry.speaker = newName;
+    }
+  });
+
+  // Update all DOM elements with that raw_id
+  document.querySelectorAll(`.speaker-label[data-raw-id="${rawId}"]`).forEach(el => {
+    el.textContent = newName;
+  });
+
+  showBanner('success', '✏️', `Speaker renamed to "${newName}"`);
 }

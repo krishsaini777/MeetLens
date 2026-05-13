@@ -44,13 +44,18 @@ def client_app(mock_env):
     from pdf_generator import PDFGenerator
 
     mock_groq = MagicMock(spec=GroqClient)
-    mock_groq.transcribe.return_value = {
+    mock_groq.transcribe_and_refine.return_value = {
         'text': 'Hello world this is a test.',
+        'raw_text': 'Hello world this is a test.',
         'language': 'en',
         'duration': 1.0,
+        'pipeline_ms': 50.0,
+        'llm_model': 'llama-3.3-70b-versatile',
+        'llm_latency_ms': 10.0,
     }
 
     mock_gemini = MagicMock(spec=GeminiClient)
+    mock_gemini.proofread_transcript.return_value = 'Hello world this is a test.'
     mock_gemini.summarize.return_value = {
         'summary': 'A brief test meeting.',
         'key_points': ['Point A', 'Point B'],
@@ -84,7 +89,7 @@ def test_health_ok(client_app):
     assert res.status_code == 200
     body = res.json()
     assert body['status'] == 'ok'
-    assert 'groq_model' in body
+    assert 'groq_whisper_model' in body
     assert 'gemini_model' in body
 
 
