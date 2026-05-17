@@ -151,7 +151,7 @@ function initApiClient() {
     // onTranscript
     (result) => {
       removeSkeleton();
-      appendTranscript(result.text, result.raw_text, result.pipeline_ms, result.speaker, result.raw_id);
+      appendTranscript(result.text, result.raw_text, result.pipeline_ms, result.speaker, result.raw_id, result.multi_speaker, result.speaker_count);
     },
     // onVADEvent
     (event) => {
@@ -333,7 +333,7 @@ function handlePause() {
 }
 
 // ── Transcript Rendering ──────────────────────
-function appendTranscript(text, rawText = '', pipelineMs = 0, speaker = '', rawId = '') {
+function appendTranscript(text, rawText = '', pipelineMs = 0, speaker = '', rawId = '', multiSpeaker = false, speakerCount = 1) {
   text = (text || '').trim();
   if (!text) return;
 
@@ -358,13 +358,15 @@ function appendTranscript(text, rawText = '', pipelineMs = 0, speaker = '', rawI
     raw_id: rawId || '',
     bookmarked: false,
     pipeline_ms: pipelineMs,
+    multi_speaker: multiSpeaker,
+    speaker_count: speakerCount,
   };
   transcript.push(entry);
   renderLine(entry);
 
   // Auto-scroll
   panelBody.scrollTop = panelBody.scrollHeight;
-  footerStatus.textContent = `segment #${segmentCount} ✓ (${pipelineMs}ms pipeline)`;
+  footerStatus.textContent = `segment #${segmentCount} ✓ (${pipelineMs}ms pipeline)${multiSpeaker ? ' | 👥 ' + speakerCount + ' speakers' : ''}`;
 }
 
 function renderLine(entry) {

@@ -452,7 +452,21 @@ class VADSession:
 
 
 def pcm_to_wav_bytes(pcm_float32: np.ndarray, sample_rate: int = 16000) -> bytes:
-    """Convert float32 PCM array to WAV bytes for the Groq API."""
+    """Convert float32 PCM array to WAV bytes for the Groq API.
+
+    Applies RMS normalization to ensure quiet audio isn't ignored by Whisper.
+    """
+    # Apply RMS normalization for consistent volume
+    rms = np.sqrt(np.mean(pcm_float32 ** 2))
+    if rms > 0.001:  # Only normalize if there's actual audio (not silence)
+        target_rms = 0.5  # Target RMS level (0-1 scale, higher = louder)
+        gain = target_rms / rms
+        # Cap gain to prevent amplifying noise too much
+        gain = min(gain, 5.0)
+        pcm_float32 = pcm_float32 * gain
+        # Clip to prevent clipping/distortion
+        pcm_float32 = np.clip(pcm_float32, -1.0, 1.0)
+
     # Convert float32 [-1, 1] to int16
     pcm_int16 = np.clip(pcm_float32 * 32767, -32768, 32767).astype(np.int16)
 
@@ -626,15 +640,39 @@ async def websocket_transcribe_remote(ws: WebSocket):
                     await ws.send_json({'type': 'vad_event', 'event': 'speech_end', 'segment_id': seg, 'duration_s': round(dur, 2)})
                     wav_bytes = pcm_to_wav_bytes(segment, config.AUDIO_SAMPLE_RATE)
                     loop = asyncio.get_event_loop()
+
                     try:
-                        raw_id, result = await asyncio.gather(
-                            loop.run_in_executor(None, diarizer_instance.get_speaker, segment, config.AUDIO_SAMPLE_RATE),
-                            loop.run_in_executor(None, groq_client.transcribe_and_refine, wav_bytes, src_lang[0], tgt_lang[0], f'remote_{seg}.wav', config.WHISPER_CUSTOM_VOCABULARY),
+                        # Get ALL speakers (not just dominant) to detect overlapping speech
+                        all_speakers_data = await loop.run_in_executor(
+                            None, diarizer_instance.get_all_speakers, segment, config.AUDIO_SAMPLE_RATE
                         )
+
+                        # Check for multiple speakers (overlapping speech)
+                        num_speakers = len(all_speakers_data.get('speakers', []))
+                        speaker_segments = all_speakers_data.get('segments', {})
+                        logger.info(f'[WS-REMOTE] Speaker detection: {num_speakers} speaker(s) detected: {all_speakers_data.get("speakers", [])}')
+
+                        # Use the dominant speaker (first one with most time) as primary
+                        raw_id = all_speakers_data['speakers'][0] if all_speakers_data['speakers'] else 'UNKNOWN'
+
+                        # Transcribe the audio
+                        result = await loop.run_in_executor(
+                            None, groq_client.transcribe_and_refine, wav_bytes, src_lang[0], tgt_lang[0], f'remote_{seg}.wav', config.WHISPER_CUSTOM_VOCABULARY
+                        )
+
+                        # Map DOM speaker to Pyannote ID if available
                         if current_dom_speaker and raw_id != 'UNKNOWN':
                             if raw_id not in user_renamed_speakers:
                                 session_speaker_map[raw_id] = current_dom_speaker
+
                         speaker_name = _resolve_speaker(raw_id)
+
+                        # Add multi-speaker indicator when overlapping speech detected
+                        is_overlapping = num_speakers > 1
+                        if is_overlapping:
+                            logger.info(f'[WS-REMOTE] Overlapping speech detected: {num_speakers} speakers — {list(speaker_segments.keys())}')
+                            speaker_name = f"👥 {speaker_name}"  # Add indicator
+
                         if result['text']:
                             await ws.send_json({
                                 'type': 'transcript', 'segment_id': seg,
@@ -644,6 +682,8 @@ async def websocket_transcribe_remote(ws: WebSocket):
                                 'pipeline_ms': result.get('pipeline_ms', 0),
                                 'llm_model': result.get('llm_model', ''),
                                 'speaker': speaker_name, 'raw_id': raw_id,
+                                'multi_speaker': is_overlapping,  # Flag for frontend
+                                'speaker_count': num_speakers,
                             })
                     except Exception as e:
                         logger.error('[WS-REMOTE] Pipeline error: %s', e)

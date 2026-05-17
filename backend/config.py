@@ -66,13 +66,13 @@ class Config:
 
     # ── Silero VAD Tuning ─────────────────────────
     VAD_THRESHOLD: float = field(
-        default_factory=lambda: float(os.getenv('VAD_THRESHOLD', '0.5'))
+        default_factory=lambda: float(os.getenv('VAD_THRESHOLD', '0.35'))
     )
     VAD_MIN_SILENCE_MS: int = field(
-        default_factory=lambda: int(os.getenv('VAD_MIN_SILENCE_MS', '700'))
+        default_factory=lambda: int(os.getenv('VAD_MIN_SILENCE_MS', '500'))
     )
     VAD_MIN_SPEECH_MS: int = field(
-        default_factory=lambda: int(os.getenv('VAD_MIN_SPEECH_MS', '250'))
+        default_factory=lambda: int(os.getenv('VAD_MIN_SPEECH_MS', '150'))
     )
     VAD_MAX_SPEECH_S: float = field(
         default_factory=lambda: float(os.getenv('VAD_MAX_SPEECH_S', '30.0'))

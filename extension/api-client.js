@@ -342,6 +342,8 @@ export class ApiClient {
             speaker: msg.speaker || '',
             raw_id: msg.raw_id || '',
             source: which,  // 'local' or 'remote'
+            multi_speaker: msg.multi_speaker || false,  // Overlapping speech detected
+            speaker_count: msg.speaker_count || 1,      // Number of speakers
           });
           break;
 
