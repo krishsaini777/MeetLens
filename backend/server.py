@@ -451,18 +451,44 @@ class VADSession:
         return prob
 
 
+# ── Known Whisper hallucination patterns ──────────────────────────────────────
+# Whisper commonly hallucinates these exact strings from silence or near-silence.
+# Rejecting them prevents false "Me" entries when the user is not speaking.
+WHISPER_HALLUCINATION_PATTERNS = {
+    'you', 'thank you', 'thanks', 'bye', 'okay', 'hmm', 'uh', 'um',
+    'ah', 'oh', 'huh', 'yeah', 'yes', 'no', 'so', 'well', 'right',
+    'the', 'a', 'i', 'it', 'is', 'and', 'but', 'or', 'question',
+    'subtitle', 'subtitles', 'thank you for watching',
+    'thanks for watching', 'subscribe', 'like and subscribe',
+    'music', 'applause', 'laughter', 'silence',
+    'merlins', 'amen', 'woof',
+}
+
+# Minimum RMS energy for a segment to be worth transcribing.
+# Below this, the audio is noise/bleed, not real speech.
+MIN_SEGMENT_RMS = 0.01
+
+# Minimum word count for transcriptions from quiet segments.
+# Single-word transcriptions from low-energy audio are almost always hallucinations.
+MIN_WORDS_QUIET_SEGMENT = 3
+
+# RMS below which a segment is considered "quiet" for hallucination filtering.
+QUIET_SEGMENT_RMS_THRESHOLD = 0.05
+
+
 def pcm_to_wav_bytes(pcm_float32: np.ndarray, sample_rate: int = 16000) -> bytes:
     """Convert float32 PCM array to WAV bytes for the Groq API.
 
     Applies RMS normalization to ensure quiet audio isn't ignored by Whisper.
+    Gain is capped at 2.0x to prevent amplifying noise into hallucinated speech.
     """
     # Apply RMS normalization for consistent volume
     rms = np.sqrt(np.mean(pcm_float32 ** 2))
-    if rms > 0.001:  # Only normalize if there's actual audio (not silence)
-        target_rms = 0.5  # Target RMS level (0-1 scale, higher = louder)
+    if rms > 0.005:  # Raised floor: only normalize if there's real audio
+        target_rms = 0.3  # Lower target: was 0.5 which over-amplified quiet segments
         gain = target_rms / rms
-        # Cap gain to prevent amplifying noise too much
-        gain = min(gain, 5.0)
+        # Cap gain at 2.0x (was 5.0x — amplifying noise by 5x caused hallucinations)
+        gain = min(gain, 2.0)
         pcm_float32 = pcm_float32 * gain
         # Clip to prevent clipping/distortion
         pcm_float32 = np.clip(pcm_float32, -1.0, 1.0)
@@ -568,16 +594,63 @@ async def websocket_transcribe_local(ws: WebSocket):
                 for segment in session.feed_pcm(pcm_f32):
                     seg += 1
                     dur = len(segment) / config.AUDIO_SAMPLE_RATE
+
+                    # ── PRE-WHISPER ENERGY GATE ──────────────────────────
+                    # Reject segments with very low RMS — they are noise,
+                    # speaker bleed through the mic, or silence that VAD
+                    # mistakenly classified as speech.
+                    seg_rms = float(np.sqrt(np.mean(segment ** 2)))
+                    if seg_rms < MIN_SEGMENT_RMS:
+                        logger.info(
+                            '[WS-LOCAL] REJECTED segment #%d: RMS=%.4f < %.4f threshold — '
+                            'too quiet to be real speech (likely bleed or noise)',
+                            seg, seg_rms, MIN_SEGMENT_RMS,
+                        )
+                        continue
+
                     await ws.send_json({'type': 'vad_event', 'event': 'speech_end', 'segment_id': seg, 'duration_s': round(dur, 2)})
                     wav_bytes = pcm_to_wav_bytes(segment, config.AUDIO_SAMPLE_RATE)
                     try:
                         result = await asyncio.get_event_loop().run_in_executor(
                             None, groq_client.transcribe_and_refine, wav_bytes, src_lang[0], tgt_lang[0], f'local_{seg}.wav', config.WHISPER_CUSTOM_VOCABULARY,
                         )
-                        if result['text']:
+                        text = (result.get('text') or '').strip()
+
+                        # ── POST-WHISPER HALLUCINATION FILTER ────────────
+                        # Whisper hallucinates common words from silence.
+                        # If the segment was quiet AND the transcript is
+                        # a known hallucination pattern, reject it.
+                        if text:
+                            text_lower = text.lower().rstrip('.')
+                            word_count = len(text.split())
+                            is_quiet = seg_rms < QUIET_SEGMENT_RMS_THRESHOLD
+
+                            # Filter 1: exact hallucination match
+                            if text_lower in WHISPER_HALLUCINATION_PATTERNS:
+                                logger.info(
+                                    '[WS-LOCAL] HALLUCINATION REJECTED segment #%d: '
+                                    '"%s" (RMS=%.4f) — known hallucination pattern',
+                                    seg, text, seg_rms,
+                                )
+                                text = ''  # Discard
+
+                            # Filter 2: quiet + very short transcript
+                            elif is_quiet and word_count < MIN_WORDS_QUIET_SEGMENT:
+                                logger.info(
+                                    '[WS-LOCAL] HALLUCINATION REJECTED segment #%d: '
+                                    '"%s" (%d words, RMS=%.4f) — too few words from quiet audio',
+                                    seg, text, word_count, seg_rms,
+                                )
+                                text = ''  # Discard
+
+                        if text:
+                            logger.info(
+                                '[WS-LOCAL] ✅ ACCEPTED segment #%d: "%s" (RMS=%.4f, %d words)',
+                                seg, text[:80], seg_rms, len(text.split()),
+                            )
                             await ws.send_json({
                                 'type': 'transcript', 'segment_id': seg,
-                                'text': result['text'], 'raw_text': result.get('raw_text', ''),
+                                'text': text, 'raw_text': result.get('raw_text', ''),
                                 'language': result.get('language', src_lang[0]),
                                 'duration': result.get('duration', dur),
                                 'pipeline_ms': result.get('pipeline_ms', 0),
