@@ -93,16 +93,19 @@ export class AudioProcessor {
 
     // Audio suppression for echo prevention
     this._tabRMS = 0;
+    this._micRMS = 0;
     this._micSuppressed = false;
     this._micSuppressedAt = 0; // timestamp when mic was suppressed
-    this._SUPPRESSION_THRESHOLD = 0.03; // Lower - suppress mic whenever speaker audio detected
-    this._SUPPRESSION_STRENGTH = 0.02; // More aggressive - reduce to 2% (almost silent)
-    this._SUPPRESSION_HYSTERESIS_MS = 300; // Faster response - 300ms before restoring
+    this._SUPPRESSION_THRESHOLD = 0.02; // Suppress mic whenever any speaker audio detected
+    this._SUPPRESSION_STRENGTH = 0.0;   // COMPLETE MUTE when suppressed (was 0.02 — even 2% caused hallucinations)
+    this._SUPPRESSION_HYSTERESIS_MS = 500; // Hold suppression 500ms after speaker stops
 
-    // Noise gate - don't send quiet audio to prevent noise transcription
-    this._noiseGateThreshold = 0.005; // Below this = ignore (very quiet)
+    // Noise gate — reject frames below this RMS to prevent silence/bleed → hallucination
+    this._noiseGateThreshold = 0.008; // Below this = silence, don't send to backend
+    this._noiseGateDropCount = 0;     // Track dropped frames for diagnostics
+    this._noiseGateSendCount = 0;     // Track sent frames for diagnostics
   }
-  }
+
 
   async start() {
     if (this._isRunning) return;
@@ -359,6 +362,31 @@ export class AudioProcessor {
     for (let i = 0; i < input.length; i++) this._micAccumulator.push(input[i]);
     while (this._micAccumulator.length >= SAMPLES_PER_FRAME) {
       const frame = this._micAccumulator.splice(0, SAMPLES_PER_FRAME);
+
+      // ── NOISE GATE: compute per-frame RMS ──────────────────────
+      // Drop frames that are below the noise floor — prevents
+      // silence, background noise, and speaker bleed from being
+      // sent to the backend and transcribed as "Me".
+      let sumSq = 0;
+      for (let i = 0; i < frame.length; i++) sumSq += frame[i] * frame[i];
+      const frameRMS = Math.sqrt(sumSq / frame.length);
+      this._micRMS = frameRMS; // store for cross-channel comparison
+
+      if (frameRMS < this._noiseGateThreshold) {
+        this._noiseGateDropCount++;
+        continue; // Drop this frame — it's silence or noise
+      }
+
+      // ── CROSS-CHANNEL ECHO REJECTION ───────────────────────────
+      // If tab (remote) audio is louder than the mic, the mic is
+      // likely picking up speaker bleed, not the user speaking.
+      // Only apply when tab audio is actually captured.
+      if (this._hasTabAudio && this._tabRMS > 0.01 && frameRMS < this._tabRMS * 1.5) {
+        this._noiseGateDropCount++;
+        continue; // Drop — mic signal is weaker than tab, likely echo
+      }
+
+      this._noiseGateSendCount++;
       this._micFrameCount++;
       this._onLocalFrame(this._float32ToInt16(frame));
     }
@@ -408,8 +436,11 @@ export class AudioProcessor {
         ? this._getRMS(this._tabAnalyser, this._tabLevelBuf)
         : 0;
 
-      // Store for use in audio processing
+      // Store for use in cross-channel echo rejection
       this._tabRMS = tabRMS;
+
+      // Also update mic RMS from analyser for level display
+      this._micRMS = micRMS;
 
       // Smart mic suppression: when speaker (tab) is talking loudly,
       // suppress mic to prevent echo/voice leak from being transcribed as "ME"
@@ -454,7 +485,7 @@ export class AudioProcessor {
       const tabRMS = this._getRMS(this._tabAnalyser, this._tabLevelBuf);
 
       console.debug(
-        `[AudioProcessor] Track health — Mic: ${mic?.readyState ?? 'none'} (RMS: ${micRMS.toFixed(4)}, frames: ${this._micFrameCount}) | Tab: ${tab?.readyState ?? 'none'} (RMS: ${tabRMS.toFixed(4)}, frames: ${this._tabFrameCount})`
+        `[AudioProcessor] Track health — Mic: ${mic?.readyState ?? 'none'} (RMS: ${micRMS.toFixed(4)}, frames: ${this._micFrameCount}) | Tab: ${tab?.readyState ?? 'none'} (RMS: ${tabRMS.toFixed(4)}, frames: ${this._tabFrameCount}) | Noise gate: sent=${this._noiseGateSendCount} dropped=${this._noiseGateDropCount} | Suppressed: ${this._micSuppressed}`
       );
 
       if (tab && tab.readyState === 'ended') {

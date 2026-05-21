@@ -237,63 +237,80 @@ async function checkBackendHealth() {
 
 // ── Session Lifecycle ─────────────────────────
 async function handleStart() {
-  const lang = langSelect.value;
-  const targetName = LANGUAGE_NAMES[lang] || 'English';
+  try {
+    console.log('[MeetLens] handleStart() invoked');
+    const lang = langSelect.value;
+    const targetName = LANGUAGE_NAMES[lang] || 'English';
 
-  // 1. Connect WebSocket first
-  await client.connectWebSocket(lang, targetName);
-  if (!client.isConnected) {
-    showBanner('error', '⚠️', 'Failed to connect to backend WebSocket.');
-    return;
+    // 1. Connect WebSocket first
+    console.log('[MeetLens] Connecting WebSocket…');
+    await client.connectWebSocket(lang, targetName);
+    if (!client.isConnected) {
+      showBanner('error', '⚠️', 'Failed to connect to backend WebSocket. Is the server running? (python backend/server.py)');
+      return;
+    }
+    console.log('[MeetLens] WebSocket connected:', { local: client.isLocalConnected, remote: client.isRemoteConnected });
+
+    // 2. Start audio capture — dual-stream: mic → local WS, tab → remote WS
+    console.log('[MeetLens] Creating AudioProcessor…');
+    processor = new AudioProcessor(
+      // onLocalFrame — mic PCM → local WebSocket
+      (pcmBuffer) => client.sendLocalAudio(pcmBuffer),
+      // onRemoteFrame — tab PCM → remote WebSocket (with DOM speaker metadata)
+      (pcmBuffer) => client.sendRemoteAudio(pcmBuffer, currentDomSpeaker),
+      // onError
+      (err) => { showBanner('error', '⚠️', err); handleStop(); },
+      // onAudioInfo
+      (audioInfo) => {
+        if (audioInfo.type === 'levels') {
+          updateMeters(audioInfo.micRMS, audioInfo.tabRMS, audioInfo.tabActive);
+          return;
+        }
+        if (audioInfo.tabStopped) {
+          showBanner('warn', '⚠️', 'Tab audio sharing stopped — only your microphone is active now.');
+          return;
+        }
+        if (audioInfo.tabActive) {
+          showBanner('success', '🎧', 'Dual-stream active! Mic → local WS, Tab → remote WS.');
+        } else {
+          showBanner('warn', '⚠️',
+            'Only microphone captured. To transcribe others: Stop → Start → share your meeting tab.'
+          );
+        }
+      },
+    );
+
+    console.log('[MeetLens] Starting audio capture…');
+    await processor.start();
+    if (!processor.isRunning) {
+      console.warn('[MeetLens] processor.start() completed but isRunning=false — audio permissions likely denied');
+      showBanner('error', '⚠️', 'Audio capture failed — please grant microphone permission and try again.');
+      return;
+    }
+    console.log('[MeetLens] Audio capture started:', { hasTabAudio: processor.hasTabAudio });
+
+    isRecording  = true;
+    isPaused     = false;
+    sessionStart = Date.now();
+    segmentCount = 0;
+    currentSpeaker = 'Speaker 1';
+    speakerHistory = [];
+    currentDomSpeaker = null;
+
+    setUIState('recording');
+    startTimer();
+    startAutosave();
+    switchTab('transcript');
+
+    footerStatus.textContent = processor.hasTabAudio
+      ? 'Dual-stream: mic → local WS, tab → remote WS'
+      : 'Mic only → local WS (tab audio unavailable)';
+
+    console.log('[MeetLens] ✅ Recording started successfully');
+  } catch (err) {
+    console.error('[MeetLens] handleStart() FAILED:', err);
+    showBanner('error', '⚠️', `Start failed: ${err.message || err}`);
   }
-
-  // 2. Start audio capture — dual-stream: mic → local WS, tab → remote WS
-  processor = new AudioProcessor(
-    // onLocalFrame — mic PCM → local WebSocket
-    (pcmBuffer) => client.sendLocalAudio(pcmBuffer),
-    // onRemoteFrame — tab PCM → remote WebSocket (with DOM speaker metadata)
-    (pcmBuffer) => client.sendRemoteAudio(pcmBuffer, currentDomSpeaker),
-    // onError
-    (err) => { showBanner('error', '⚠️', err); handleStop(); },
-    // onAudioInfo
-    (audioInfo) => {
-      if (audioInfo.type === 'levels') {
-        updateMeters(audioInfo.micRMS, audioInfo.tabRMS, audioInfo.tabActive);
-        return;
-      }
-      if (audioInfo.tabStopped) {
-        showBanner('warn', '⚠️', 'Tab audio sharing stopped — only your microphone is active now.');
-        return;
-      }
-      if (audioInfo.tabActive) {
-        showBanner('success', '🎧', 'Dual-stream active! Mic → local WS, Tab → remote WS.');
-      } else {
-        showBanner('warn', '⚠️',
-          'Only microphone captured. To transcribe others: Stop → Start → share your meeting tab.'
-        );
-      }
-    },
-  );
-
-  await processor.start();
-  if (!processor.isRunning) return;
-
-  isRecording  = true;
-  isPaused     = false;
-  sessionStart = Date.now();
-  segmentCount = 0;
-  currentSpeaker = 'Speaker 1';
-  speakerHistory = [];
-  currentDomSpeaker = null;
-
-  setUIState('recording');
-  startTimer();
-  startAutosave();
-  switchTab('transcript');
-
-  footerStatus.textContent = processor.hasTabAudio
-    ? 'Dual-stream: mic → local WS, tab → remote WS'
-    : 'Mic only → local WS (tab audio unavailable)';
 }
 
 function handleStop() {
